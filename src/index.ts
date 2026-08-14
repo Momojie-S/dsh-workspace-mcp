@@ -24,9 +24,10 @@ const Config = z.object({
 });
 
 function apply(ctx: Context, config: PluginConfig) {
-  const log = (msg: string) => ctx.logger.info(`[ws-mcp] ${msg}`);
-  const warn = (msg: string) => ctx.logger.warn(`[ws-mcp] ${msg}`);
+  const log = (msg: string) => console.error(`[ws-mcp] ${msg}`);
+  const warn = (msg: string) => console.error(`[ws-mcp][warn] ${msg}`);
 
+  console.error("[ws-mcp] apply() 被调用，插件已加载");
   if (!config.probe) return;
   log("探针已加载");
 
@@ -53,6 +54,23 @@ function apply(ctx: Context, config: PluginConfig) {
     "session/disposed",
     (sessionId: string) => {
       log(`PROBE session/disposed: id=${sessionId}`);
+    },
+    { global: true }
+  );
+
+  // === 探测点 2.5: agent/created (关键！agent-scoped 工具注册的钩子点) ===
+  // 目标：确认能拿到 agent.ctx (scoped) 和 agent.session.header.cwd
+  bus.on(
+    "agent/created",
+    ({ agent }: any) => {
+      const agentCtx = agent?.ctx;
+      const session = agent?.session;
+      const cwd = session?.header?.cwd;
+      const hasTools = typeof agentCtx?.tools?.register === "function";
+      log(`PROBE agent/created: cwd=${cwd ?? "(无)"} agent.ctx.tools.register=${hasTools}`);
+      // 探测 agent 对象暴露了什么
+      const akeys = agent ? Object.getOwnPropertyNames(agent).slice(0, 20).join(",") : "(null)";
+      log(`PROBE agent keys: ${akeys}`);
     },
     { global: true }
   );
