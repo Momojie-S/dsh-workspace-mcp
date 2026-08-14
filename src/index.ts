@@ -2,57 +2,89 @@
  * @momojie-s/dsh-workspace-mcp
  *
  * 按 workspace（session.header.cwd）自动加载/卸载 MCP server。
- * 工具注册到 agent scope，随 agent 生灭自动回收。
  *
- * 当前为探针版本：仅验证数据链路（session/created 事件能否拿到 cwd、
- * agent 生命周期挂钩点是否可达），尚未接入 MCP 连接。
+ * 当前为增强探针：探测所有候选挂钩点，摸清数据链路，
+ * 确定 MCP 加载应挂在 session/created 还是 agent 创建路径。
  */
 
 import { Context } from "@deepseek-ai/cordis";
 import z from "@deepseek-ai/schemastery";
 
-/** 插件名（Cordis 插件标识）。 */
 const name = "workspace-mcp";
-
-/** 依赖的 Cordis 服务。 */
 const inject = ["tools"];
 
-/** 配置 schema：MCP 配置文件的发现规则。 */
+interface PluginConfig {
+  configFile: string;
+  probe: boolean;
+}
+
 const Config = z.object({
-  /** 在 session.cwd 下查找的 MCP 配置文件相对路径。 */
   configFile: z.string().default(".dsh/mcp.patch.yml"),
-  /** 是否启用探针日志（打印 cwd、session 事件、agent 事件）。 */
   probe: z.boolean().default(true),
 });
 
-/**
- * 插件入口。
- *
- * 探针阶段：订阅 session/created，打印 header.cwd，确认数据链路。
- * 后续：读 cwd 下的 mcp.patch.yml，按 agent scope 注册 MCP 工具。
- */
-function apply(ctx: Context, config: z.infer<typeof Config>) {
-  const log = (msg: string) => ctx.logger.info(`[workspace-mcp] ${msg}`);
+function apply(ctx: Context, config: PluginConfig) {
+  const log = (msg: string) => ctx.logger.info(`[ws-mcp] ${msg}`);
+  const warn = (msg: string) => ctx.logger.warn(`[ws-mcp] ${msg}`);
 
-  if (config.probe) {
-    log(`插件已加载，configFile=${config.configFile}`);
-  }
+  if (!config.probe) return;
+  log("探针已加载");
 
-  // 验证点 1：session/created 能否拿到 header.cwd
-  ctx.on(
+  const bus = ctx as any;
+
+  // === 探测点 1: session/created ===
+  // 目标：确认能拿到 session.header.cwd
+  bus.on(
     "session/created",
     (session: any) => {
-      const cwd: string | undefined = session?.header?.cwd;
-      log(`session/created: id=${session?.id} cwd=${cwd ?? "(无)"}`);
+      const cwd = session?.header?.cwd;
+      const sid = session?.id;
+      log(`PROBE session/created: id=${sid} cwd=${cwd ?? "(无)"}`);
+      // 探测 session 对象结构，看有没有 agent 关联
+      const keys = session ? Object.keys(session).slice(0, 15).join(",") : "(null)";
+      log(`PROBE session keys: ${keys}`);
     },
     { global: true }
   );
 
-  // 验证点 2：session/disposed 是否如预期（切 workspace 时是否触发）
-  ctx.on(
+  // === 探测点 2: session/disposed ===
+  // 目标：确认切 workspace 时是否触发（预判：不触发）
+  bus.on(
     "session/disposed",
     (sessionId: string) => {
-      log(`session/disposed: id=${sessionId}`);
+      log(`PROBE session/disposed: id=${sessionId}`);
+    },
+    { global: true }
+  );
+
+  // === 探测点 3: tools.register 调用监控 ===
+  // 目标：看 web 对话期间有哪些工具被注册、注册时的 ctx 是否带 scope/agent
+  // 用拦截方式观察，不影响原行为
+  try {
+    const tools = (ctx as any).tools;
+    if (tools && typeof tools.register === "function" && !tools.__wsProbed) {
+      const origRegister = tools.register.bind(tools);
+      tools.__wsProbed = true;
+      tools.register = (def: any) => {
+        const tname = def?.name ?? "?";
+        if (typeof tname === "string" && tname.startsWith("mcp__")) {
+          log(`PROBE tools.register: ${tname}`);
+        }
+        return origRegister(def);
+      };
+    }
+  } catch (e: any) {
+    warn(`PROBE tools hook 失败: ${e?.message}`);
+  }
+
+  // === 探测点 4: domain/changed (workspace 切换信号) ===
+  // 目标：看切 workspace 时 domain 层是否发出事件
+  bus.on(
+    "domain/changed",
+    (change: any) => {
+      if (change?.domain === "workspace" || change?.table === "workspaces") {
+        log(`PROBE domain/changed workspace: op=${change?.operation} id=${change?.id ?? "?"}`);
+      }
     },
     { global: true }
   );
