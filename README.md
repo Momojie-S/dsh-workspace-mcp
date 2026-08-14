@@ -1,27 +1,14 @@
 # @momojie-s/dsh-workspace-mcp
 
-DSH (DeepSeek Harness) 插件：按 **workspace（session 的 cwd）** 自动加载/卸载 MCP server。MCP 工具注册到 agent scope，随 agent 生灭自动回收，不同项目（workspace）的 MCP 互不干扰。
+DSH 插件：按 **workspace（session cwd）** 自动加载/卸载 MCP server——每个项目自己的 `.dsh/mcp.servers.yml` 只在自己的会话生效，MCP 工具注册到 agent scope，随 agent 生灭自动回收，不同项目的 MCP 互不干扰。
 
-## 状态
+## 环境要求
 
-已跑通端到端验证（headless + server-everything 测试 server）：
-- ✅ 按 cwd 读取项目级 `.dsh/mcp.servers.yml`
-- ✅ agent-scoped 注册 MCP 工具（`mcp__<server>__<tool>`）
-- ✅ workspace 隔离（无配置的目录不加载 MCP）
+- DSH `0.1.0-rc.6`（已验证）
 
-## 机制
+## 用法
 
-1. 全局监听 `agent/pre-step`（agent 真正开始工作时、ctx active）
-2. 首次触发时读 `<cwd>/<configFile>` 里的 MCP server 列表
-3. 对每个 server 用 `@modelcontextprotocol/sdk` 连接、发现工具
-4. 在 `agent.ctx` scope 注册工具（agent-scoped，随 agent 回收）
-5. `agent/disposed` 时断开连接、卸载工具
-
-为什么不是 `session/created`：agent.ctx 在 created 时 inactive，注册工具会失败。`agent/pre-step` 是 ctx active 的最早可靠时机，且是懒加载（agent 不工作就不连 MCP）。
-
-## 项目级配置
-
-在项目根放 `.dsh/mcp.servers.yml`：
+项目根放 `.dsh/mcp.servers.yml`：
 
 ```yaml
 servers:
@@ -37,30 +24,62 @@ servers:
       Authorization: "Bearer <token>"
 ```
 
-字段与 `@deepseek-ai/dsh-mcp-client` 的 Config 对齐（`transport` / `command` / `args` / `env` / `url` / `headers` / `toolCallTimeoutMs`）。
+字段与 `@deepseek-ai/dsh-mcp-client` 对齐（`transport` / `command` / `args` / `env` / `url` / `headers` / `toolCallTimeoutMs`）。
 
-## 安装到 DSH profile
+- agent 首次干活时（`agent/pre-step`）懒加载连接，不干活不连
+- 改配置文件由 chokidar 监听，保存即重载；无该文件的目录不加载任何 MCP
 
-```shell
-dsh plugin --profile web add <本插件路径>
+## 安装
+
+本插件是**组合包**（`dsh.bundle`），用 `dsh plugin` 安装进 profile，自动追加配置层，无需手编 patch：
+
+```bash
+# GitHub（私仓需 git 凭据；pnpm ≥10 首次 add 会提示授权构建，按提示把包键
+# 写进 ~/.dsh/profiles/web/pnpm-workspace.yaml 的 allowBuilds 后重新 add）
+dsh plugin --profile web add github:Momojie-S/dsh-workspace-mcp
+
+# 或 tarball（pnpm pack 产物，无授权要求）
+dsh plugin --profile web add momojie-s-dsh-workspace-mcp-0.1.0.tgz
 ```
 
-在 `~/.dsh/profiles/web/cordis.patch.yml` 加：
+验证层就位后重启 DSH：
+
+```bash
+dsh web --dump-config | Select-String workspace-mcp   # 应看到对应层
+```
+
+<details><summary>开发模式：源码直连（改代码 → 重启验证）</summary>
+
+编译 `npm install && npm run build`，profile 的 `cordis.patch.yml` 手动加行（`name` 用 `file:///` URL 指向 `lib/index.js`）：
 
 ```yaml
 - insert:
     - id: workspace-mcp
-      name: '@momojie-s/dsh-workspace-mcp'
+      name: file:///D:/code/workspace/deepseek-harness-101/plugins/dsh-workspace-mcp/lib/index.js
       config:
-        configFile: '.dsh/mcp.servers.yml'  # 默认值，可省略
+        configFile: '.dsh/mcp.servers.yml'
         verbose: true
 ```
 
-## 开发
+</details>
 
-```shell
-npm install
-npm run build      # tsc → lib/
+## 配置
+
+| 字段 | 默认值 | 说明 |
+|------|--------|------|
+| `configFile` | `.dsh/mcp.servers.yml` | 相对 workspace 根的配置文件路径 |
+| `verbose` | `false` | 输出连接/注册详细日志，排查用 |
+
+## 验证
+
+项目根放 `.dsh/mcp.servers.yml` 配一个测试 server（如 MCP 官方 `server-everything`），在会话里让 agent 列工具：
+
+```
+mcp__<serverName>__<toolName>
 ```
 
-peer deps（`@deepseek-ai/cordis` 等）由 DSH 运行时提供；`@modelcontextprotocol/sdk` 和 `js-yaml` 是本插件直接依赖。
+工具出现即生效；切到无配置的目录，这些工具不再出现，即隔离生效。
+
+---
+
+设计文档见 [docs/design/overview.md](docs/design/overview.md)；MCP 配置详解与踩坑见合集仓库 `docs/usage/mcp.md`。
