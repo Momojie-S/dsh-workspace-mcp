@@ -54,7 +54,6 @@ function apply(ctx: Context, config: PluginConfig) {
     if (config.verbose) console.error(`[ws-mcp] ${msg}`);
   };
   log(`插件已加载，configFile=${config.configFile}`);
-
   const bus = ctx as any;
 
   bus.on(
