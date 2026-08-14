@@ -43,6 +43,8 @@ interface AgentState {
 }
 
 /** agent id → 加载状态。 */
+
+
 const statesByAgent = new Map<string, AgentState>();
 /** 已初始化（建好 watcher）的 agent 对象集合，避免重复初始化。 */
 const initedAgents = new WeakSet<object>();
@@ -58,8 +60,7 @@ function apply(ctx: Context, config: PluginConfig) {
   bus.on(
     "agent/pre-step",
     async ({ agent }: any, next: () => any) => {
-      const result = await next();
-      if (agent && !initedAgents.has(agent)) {
+      const result = await next();      if (agent && !initedAgents.has(agent)) {
         initedAgents.add(agent);
         await initAgent(agent, config, log);
       }
