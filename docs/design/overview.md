@@ -35,3 +35,4 @@ agent/disposed / fiber dispose：断开连接、卸载工具、清 watcher
 
 - 改本插件代码需 `npx tsc` + 重启 DSH（Node ESM 缓存，通用限制）
 - patch 的 `name` 必须指向 `lib/` 构建产物（曾因长期指向已废弃的热加载目录 `dist-dev-*` 出过会话毒化事故，该方案已删除）
+- 配置里 `stdio` 的 `env` / `http` 的 `headers` 只作用于**本插件发起的连接**；`streamable-http` server 的**进程环境**（如它需要的 `PYTHONPATH`）由启动方决定，DSH 配置够不着——需在启动方（daemon/GUI/脚本）注入。实例：sr_od 主 server 依赖 `PYTHONPATH=src`，最终落在 daemon/GUI 的 spawn 代码里显式注入，而不是任何 DSH 配置

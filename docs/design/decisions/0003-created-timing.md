@@ -28,3 +28,18 @@
 - headless "create 后立刻 followup" 仍是竞速：输了则第 2 步可见（可接受，非同步通道无解）
 - 懒加载语义弱化：agent 创建即连接，不干活也会连（轻微资源代价，换首步可见）
 - 双钩子并存，去重集合 `initedAgents` 保证幂等
+
+## 验证记录（2026-08-14 实测）
+
+关键事实来自 DSH 源码 `agent-loop/src/agent.ts` 的 `preStep()`：`systemPrompt.assemble()`（产出 `assembly.tools`）在 `agent/pre-step` waterfall **之前**执行，所以 pre-step 内的注册/等待都无法影响本步工具集——这不是实现瑕疵，是组装顺序的结构性事实。
+
+验证链（会话日志 request/header 信封 + 行为）：
+
+| 实验 | 结果 |
+|---|---|
+| 动态插件在 `agent/created` 里于 `agent.ctx` 注册探针工具 → 后台子代理 | 注册无异常；子代理**首个请求信封**即含探针；第一个动作直接调用成功 |
+| pre-step 时机（旧版，StarRail 工作区） | 单步问答的请求信封 `mcp__sr_od*` 计数 = 0——"插件不生效"体验的根因 |
+| created 时机（新版，StarRail 工作区，headless） | request 1 = 0（create 后立即 followup，竞速输）；request 2 = 34 个 sr_od 工具 |
+| 曾尝试"pre-step 有界等待 created 完成" | **无效**：本步工具集已定型，等待只拖慢首步——已删除，勿复发 |
+
+辅助结论：`agent/created` 的 inactive-ctx 限制只影响"依赖 `agentCtx.effect` 注册"的写法（effect 需激活的 fiber）；插件自持 disposer 即不受限。
