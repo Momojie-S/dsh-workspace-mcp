@@ -26,7 +26,7 @@ servers:
 
 字段与 `@deepseek-ai/dsh-mcp-client` 对齐（`transport` / `command` / `args` / `env` / `url` / `headers` / `toolCallTimeoutMs`）。
 
-- agent 首次干活时（`agent/pre-step`）懒加载连接，不干活不连
+- agent 创建即连接注册（`agent/created`），**首个模型请求就含这些工具**；headless "create 后立刻发消息" 的竞速场景第 1 步可能没有，第 2 步必有
 - 改配置文件由 chokidar 监听，保存即重载；无该文件的目录不加载任何 MCP
 
 ## 安装
