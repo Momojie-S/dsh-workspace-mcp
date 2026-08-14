@@ -8,11 +8,52 @@ import { ListToolsResultSchema } from "@modelcontextprotocol/sdk/types.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { createHash } from "node:crypto";
+import { z } from "zod";
 import type { ServerConfig } from "./config.js";
 
 const MAX_PUBLIC_NAME_LENGTH = 64;
 const INVALID_NAME_CHARS = /[^A-Za-z0-9_-]/g;
 const HASH_LENGTH = 12;
+
+/**
+ * 宽松结果校验 schema：信任 MCP server 返回的 JSON，只做 record(shape) 校验，
+ * 不让 SDK 用 CallToolResultSchema 预校验（否则遇到结构化/兼容结果会失败）。
+ * 与官方 dsh-mcp-client 的 RawCallToolResultSchema 一致。
+ */
+const RawCallToolResultSchema = z.record(z.string(), z.unknown());
+
+/**
+ * 从 MCP content 数组中提取文本，与官方 dsh-mcp-client 的 extractText 一致。
+ * text blocks 拼接为字符串；image/audio/resource 替换为占位符。
+ */
+function extractText(mcpContent: any[], toolName: string): string {
+  const parts: string[] = [];
+  for (const value of mcpContent) {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      parts.push("[unsupported content type: unknown]");
+      continue;
+    }
+    const block = value as Record<string, any>;
+    switch (block.type) {
+      case "text":
+        if (block.text !== undefined) parts.push(String(block.text));
+        break;
+      case "image":
+        parts.push(`[image: ${block.mimeType ?? "unknown"}, content discarded]`);
+        break;
+      case "audio":
+        parts.push(`[audio: ${block.mimeType ?? "unknown"}, content discarded]`);
+        break;
+      case "resource":
+      case "resource_link":
+        parts.push("[resource: content discarded]");
+        break;
+      default:
+        parts.push(`[unsupported content type: ${block.type ?? "unknown"}]`);
+    }
+  }
+  return parts.join("\n") || `(${toolName} returned no text content)`;
+}
 
 /** 一个 server 的连接句柄：用于 agent 销毁时清理。 */
 export interface ServerHandle {
@@ -115,16 +156,45 @@ export async function connectAndRegister(
             type: "object",
             properties: { content: { type: "array", items: {} } },
           },
-          render(result: any): string {
-            return renderToolResult(result);
+          render(_args: any, value: any): any[] {
+            // render 必须返回 ContentBlocks 数组，不能返回纯字符串。
+            // DSH 的 contentHasImage 会递归对 tool-result 的 content 调用 .some()，
+            // 如果返回字符串会导致 "content.some is not a function" 错误，
+            // 且该错误会持久化到 session 日志中，导致后续每轮对话都失败。
+            const content = Array.isArray(value?.content) ? value.content : [];
+            return [{ type: "text", text: extractText(content, rawName) }];
           },
         },
         async execute(args: any, exec: any) {
-          return await client.request(
-            { method: "tools/call", params: { name: rawName, arguments: args } },
-            { parse: (x: any) => x, jsonSchema: undefined } as any,
+          const argObj = typeof args === "object" && args !== null ? args : {};
+          const result = await client.request(
+            { method: "tools/call", params: { name: rawName, arguments: argObj } },
+            RawCallToolResultSchema,
             { signal: exec?.signal, timeout: timeoutMs }
           );
+          // MCP 返回的 content 可能不是数组（某些 server 返回 toolResult / 其他结构），
+          // 与官方 dsh-mcp-client 一致：归一化为标准 content 数组。
+          if (!Array.isArray(result?.content)) {
+            const rendered =
+              result && "toolResult" in result ? JSON.stringify((result as any).toolResult) : "(no output)";
+            const text = typeof rendered === "string" ? rendered : "(no output)";
+            if (result?.isError === true) {
+              throw new Error(text);
+            }
+            return {
+              content: [{ type: "text", text }],
+              ...result?.structuredContent !== undefined ? { structuredContent: result.structuredContent } : {},
+            };
+          }
+          // 标准 content 数组路径
+          const content = result.content;
+          if (result?.isError === true) {
+            throw new Error(extractText(content, rawName));
+          }
+          return {
+            content,
+            ...result?.structuredContent !== undefined ? { structuredContent: result.structuredContent } : {},
+          };
         },
       });
       disposers.push(d);
@@ -135,17 +205,4 @@ export async function connectAndRegister(
 
   log(`server "${serverName}": 注册 ${disposers.length} 个工具`);
   return { serverName, client, disposers };
-}
-
-function renderToolResult(result: any): string {
-  if (!result || !Array.isArray(result.content)) return "(空结果)";
-  const parts: string[] = [];
-  for (const block of result.content) {
-    if (block && typeof block === "object" && block.type === "text" && typeof block.text === "string") {
-      parts.push(block.text);
-    } else if (block && typeof block === "object") {
-      parts.push(`[${block.type ?? "block"}]`);
-    }
-  }
-  return parts.join("\n");
 }

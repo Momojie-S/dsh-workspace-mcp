@@ -5,3 +5,6 @@ dist/
 *.tsbuildinfo
 .DS_Store
 Thumbs.db
+
+# dsh workspace-env（本地凭据，绝不入库）
+.env
