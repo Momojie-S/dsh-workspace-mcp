@@ -6,6 +6,7 @@
 - MCP 工具注册到 agent scope，随 agent 生灭自动回收，不同项目互不干扰
 - **首步可见**：agent 创建即连接注册，首个模型请求就含 `mcp__*` 工具（[ADR-0003](decisions/0003-created-timing.md)）
 - **断线自愈**：启动失败与中途断线自动重连 + 工具重注册（[ADR-0004](decisions/0004-reconnect-supervisor.md)，移植官方 dsh-mcp-client 的 supervisor）
+- **会话失效自愈**：streamable-http server 重启/会话驱逐后的 "Session not found" 主动判定断线并换代重连（[ADR-0005](decisions/0005-session-loss-detection.md)，官方 dsh-mcp-client 亦有此盲区，本插件先修）
 
 ## 非目标
 
@@ -21,7 +22,7 @@ agent/created（global，fire-and-forget 异步连接）
   ↓
 对每个 server：supervisor 受监督连接（@modelcontextprotocol/sdk）
   连接 → 发现工具 → 在 agent.ctx 注册（agent-scoped，随 agent 回收）
-  断线（onclose）/ 启动失败 → 指数退避重连（换代新 client）→ 重新注册
+  断线（onclose / 会话失效识别）/ 启动失败 → 指数退避重连（换代新 client）→ 重新注册
   toolListChanged 通知 → 工具列表重同步
   ↓
 agent/pre-step 兜底：HMR 重载后已存在 agent 没有 created 事件，补初始化

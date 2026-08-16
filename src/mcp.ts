@@ -13,6 +13,9 @@
  *     或重启是唯一恢复路径
  *   - 监听 ToolListChangedNotification：server 热改工具列表即时重同步
  *   - close 竞态防护：失败一代 5s 内未确认关闭则停止重连，避免 stdio 进程重叠
+ *   - 会话失效主动判定（ADR-0005）：streamable-http 的 server 重启/会话驱逐只表现为
+ *     请求错误（HTTP 404 / "Session not found"），transport 不 close、onclose 永不
+ *     触发；在工具调用与重同步失败路径上识别此类错误，主动换代重连
  */
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -41,6 +44,27 @@ const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
  * 与官方 dsh-mcp-client 的 RawCallToolResultSchema 一致。
  */
 const RawCallToolResultSchema = z.record(z.string(), z.unknown());
+
+/**
+ * 会话失效文案特征：覆盖官方 SDK server（"Session not found"）、FastMCP 系
+ * （"Session has expired"）及常见变体。HTTP 404 单独成条件（MCP streamable-http
+ * 规范里 404 = 会话未知/已终止；StreamableHTTPError.code 即 HTTP 状态码）。
+ */
+const SESSION_LOSS_MESSAGE_PATTERN =
+  /session not found|session (has )?expired|invalid or expired session|unknown session/i;
+
+/**
+ * 判断一个错误是否表明 server 侧会话已失效（server 重启 / 会话驱逐 / 重新部署）。
+ *
+ * 此类错误只会让当次请求失败——transport 不 close、onclose 永不触发，supervisor
+ * 若无人上报就永远不知道会话已死（工具持续失败直到改配置或重启）。保守匹配：
+ * 偶发 5xx、超时等瞬时错误不在此列，不应触发换代。
+ */
+export function isSessionLossError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  if ((error as any).code === 404) return true;
+  return SESSION_LOSS_MESSAGE_PATTERN.test(error.message ?? "");
+}
 
 /**
  * 从 MCP content 数组中提取文本，与官方 dsh-mcp-client 的 extractText 一致。
@@ -156,7 +180,8 @@ function buildToolDefinition(
   generation: Client,
   serverName: string,
   tool: any,
-  cfg: ServerConfig
+  cfg: ServerConfig,
+  onSessionLoss: (generation: Client) => void
 ): any {
   const publicName = publicToolName(serverName, tool.name);
   const rawName = tool.name;
@@ -181,11 +206,20 @@ function buildToolDefinition(
     },
     async execute(args: any, exec: any) {
       const argObj = typeof args === "object" && args !== null ? args : {};
-      const result = await generation.request(
-        { method: "tools/call", params: { name: rawName, arguments: argObj } },
-        RawCallToolResultSchema,
-        { signal: exec?.signal, timeout: timeoutMs }
-      );
+      let result: any;
+      try {
+        result = await generation.request(
+          { method: "tools/call", params: { name: rawName, arguments: argObj } },
+          RawCallToolResultSchema,
+          { signal: exec?.signal, timeout: timeoutMs }
+        );
+      } catch (e) {
+        // 会话失效（如 server 重启后的 "Session not found"）不会触发 onclose，
+        // 必须在此上报 supervisor 换代重连；错误本身照常上抛——本次调用失败，
+        // 重连成功后模型重试即命中新会话。
+        if (isSessionLossError(e)) onSessionLoss(generation);
+        throw e;
+      }
       // MCP 返回的 content 可能不是数组（某些 server 返回 toolResult / 其他结构），
       // 与官方 dsh-mcp-client 一致：归一化为标准 content 数组。
       if (!Array.isArray(result?.content)) {
@@ -227,7 +261,8 @@ async function syncTools(
   serverName: string,
   cfg: ServerConfig,
   previous: Map<string, () => void>,
-  log: (msg: string) => void
+  log: (msg: string) => void,
+  onSessionLoss: (generation: Client) => void
 ): Promise<Map<string, () => void>> {
   const tools: any[] = [];
   let cursor: string | undefined;
@@ -247,7 +282,7 @@ async function syncTools(
   for (const tool of tools) {
     try {
       const d = agentCtx.tools.register(
-        buildToolDefinition(generation, serverName, tool, cfg)
+        buildToolDefinition(generation, serverName, tool, cfg, onSessionLoss)
       );
       disposers.set(publicToolName(serverName, tool.name), d);
     } catch (e: any) {
@@ -302,7 +337,9 @@ export function startSupervisedConnection(
   function enqueueSync(generation: Client): Promise<void> {
     const run = syncChain.then(async () => {
       if (!isCurrent(generation)) return;
-      disposers = await syncTools(generation, agentCtx, serverName, cfg, disposers, log);
+      disposers = await syncTools(
+        generation, agentCtx, serverName, cfg, disposers, log, reportSessionLoss
+      );
     });
     syncChain = run.catch(() => {});
     return run;
@@ -314,6 +351,20 @@ export function startSupervisedConnection(
     client = undefined;
     clientClosed = undefined;
     scheduleReconnect();
+  }
+
+  /**
+   * 会话失效上报：execute / 重同步在已建立的一代上识别出 "Session not found"
+   * 类错误时调用。等价断线判定——streamable-http 的 transport 在 server 重启/
+   * 会话驱逐后不会自己 close，onclose 永不触发，必须在此主动换代；旧代后台
+   * 关闭（其 onclose 因 isCurrent 已失而幂等无害）。并发多个调用同时失败时，
+   * isCurrent 守卫保证只有第一个生效。
+   */
+  function reportSessionLoss(generation: Client): void {
+    if (!isCurrent(generation)) return;
+    log(`${label}: server 会话已失效（如 Session not found），判定断线并重连`);
+    generation.close().catch(() => {});
+    generationDown(generation);
   }
 
   /** 等 transport 自己的关闭信号，坏 transport 不至于把 teardown 挂死。 */
@@ -390,7 +441,9 @@ export function startSupervisedConnection(
       try {
         await enqueueSync(generation);
       } catch (e: any) {
-        if (!disposed) log(`${label}: 工具重同步失败: ${e?.message ?? e}`);
+        if (disposed) return;
+        if (isSessionLossError(e)) reportSessionLoss(generation);
+        else log(`${label}: 工具重同步失败: ${e?.message ?? e}`);
       }
     });
     try {

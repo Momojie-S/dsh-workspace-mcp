@@ -28,6 +28,7 @@ servers:
 
 - agent 创建即连接注册（`agent/created`），**首个模型请求就含这些工具**；headless "create 后立刻发消息" 的竞速场景第 1 步可能没有，第 2 步必有
 - **断线自动重连**（移植官方 dsh-mcp-client 的 supervisor）：启动失败与中途断线均按指数退避重连并重新注册工具；重连期间旧工具保持注册（调用会失败），server 恢复后自动换新。stdio = 重新 spawn，http = 重新握手
+- **会话失效自愈**（≥0.2.1，官方 client 尚无此能力）：streamable-http server 重启/会话驱逐后的 `Session not found` 类错误自动判定断线并换代重连，无需手动"强制重连"
 - server 发 `toolListChanged` 通知时自动重同步工具列表
 - 改配置文件由 chokidar 监听，保存即重载；无该文件的目录不加载任何 MCP
 
@@ -105,7 +106,7 @@ mcp__<serverName>__<toolName>
 断线重连的可执行验证（不经 DSH host）：
 
 ```bash
-npm test   # 杀 server 子进程 → 自动重连恢复；启动失败 → 退避重试 → 放弃卸载
+npm test   # 杀 server 子进程 → 自动重连恢复；启动失败 → 退避重试 → 放弃卸载；Session not found → 换代重连
 ```
 
 ---
