@@ -1,6 +1,6 @@
 {
   "name": "@momojie-s/dsh-workspace-mcp",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "DSH 插件: 按 workspace(session cwd) 自动加载/卸载 MCP server, 工具注册到 agent scope",
   "type": "module",
   "main": "lib/index.js",
@@ -21,7 +21,7 @@
     "build": "tsc",
     "build:watch": "tsc --watch",
     "prepare": "npm run build",
-    "test": "node test/reconnect-smoke.mjs && node test/reconnect-giveup.mjs && node test/session-loss.mjs",
+    "test": "node test/reconnect-smoke.mjs && node test/reconnect-giveup.mjs && node test/session-loss.mjs && node test/parity.mjs",
     "clean": "node -e \"require('fs').rmSync('lib',{recursive:true,force:true})\""
   },
   "dsh": {
@@ -33,6 +33,7 @@
     "@deepseek-ai/cordis": "^4.0.1",
     "@deepseek-ai/dsh-invariants": "^0.1.0-rc.6",
     "@deepseek-ai/dsh-session": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-subprocess": "^0.1.0-rc.6",
     "@deepseek-ai/dsh-tools": "^0.1.0-rc.6",
     "@deepseek-ai/schemastery": "^3.18.1"
   },

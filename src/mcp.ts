@@ -16,6 +16,9 @@
  *   - 会话失效主动判定（ADR-0005）：streamable-http 的 server 重启/会话驱逐只表现为
  *     请求错误（HTTP 404 / "Session not found"），transport 不 close、onclose 永不
  *     触发；在工具调用与重同步失败路径上识别此类错误，主动换代重连
+ *   - 官方对齐补齐（ADR-0006）：stdio 子进程 scrubbed 父环境继承、重复 public 名
+ *     守卫、注册冲突整代回滚、outputSchema→structuredContent 输出契约、
+ *     taskSupport=required 明确拒绝
  */
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -25,6 +28,8 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { scrubbedParentEnv } from "@deepseek-ai/dsh-subprocess";
+import { assertSupportedJsonSchema } from "@deepseek-ai/dsh-tools";
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { ReconnectPolicy, ServerConfig } from "./config.js";
@@ -110,12 +115,69 @@ export function publicToolName(serverName: string, rawName: string): string {
   return `${normalized.slice(0, MAX_PUBLIC_NAME_LENGTH - HASH_LENGTH - 1)}_${hash}`;
 }
 
+/**
+ * 保留 server 声明的 outputSchema 中受支持的 JSON Schema 词汇；不支持
+ * 的词汇整体降级为 undefined（不声明 structuredContent 契约），与官方
+ * dsh-mcp-client 的 supportedOutputSchema 一致。
+ */
+function supportedOutputSchema(candidate: unknown): any {
+  if (candidate === undefined) return undefined;
+  try {
+    assertSupportedJsonSchema(candidate as any);
+    return candidate;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * 工具输出契约（与官方 dsh-mcp-client 的 createOutput 一致）：
+ * content 数组 + structuredContent（server 声明且受支持时为该 schema，
+ * 否则空对象占位）；additionalProperties: false；声明了 structured
+ * schema 时两项都 required。render 投影与官方一致（文本提取）。
+ */
+function createOutput(rawName: string, structuredSchema: any): any {
+  return {
+    schema: {
+      type: "object",
+      properties: {
+        content: { type: "array", items: {} },
+        structuredContent: structuredSchema ?? {},
+      },
+      required:
+        structuredSchema === undefined ? ["content"] : ["content", "structuredContent"],
+      additionalProperties: false,
+    },
+    render(_args: any, value: any): any[] {
+      // render 必须返回 ContentBlocks 数组，不能返回纯字符串。
+      // DSH 的 contentHasImage 会递归对 tool-result 的 content 调用 .some()，
+      // 如果返回字符串会导致 "content.some is not a function" 错误，
+      // 且该错误会持久化到 session 日志中，导致后续每轮对话都失败。
+      const content = Array.isArray(value?.content) ? value.content : [];
+      return [{ type: "text", text: extractText(content, rawName) }];
+    },
+  };
+}
+
+/**
+ * stdio 子进程环境基座（与官方 dsh-mcp-client 的 buildChildEnv 一致）：
+ * scrubbed 父环境 + yml 显式 env（显式项覆盖同名 scrub 项）。
+ *
+ * SDK 的 StdioClientTransport 只给安全子集（PATH 等十余个），需要其余父环境
+ * 变量（如 PYTHONPATH）的 server 会缺变量；scrubbedParentEnv 剥离凭据形状名
+ * （/KEY|PASSWORD|SECRET|TOKEN/i）与 DSH_* 前缀名，杜绝 harness 凭据/状态
+ * 隐式泄漏，显式传入的敏感名仍可通过（merge 在 scrub 之后）。
+ */
+function buildChildEnv(extra: Record<string, string> | undefined): Record<string, string> {
+  return { ...scrubbedParentEnv(), ...extra };
+}
+
 function createTransport(cfg: ServerConfig) {
   if (cfg.transport === "stdio") {
     return new StdioClientTransport({
       command: cfg.command!,
       args: cfg.args ?? [],
-      env: cfg.env as Record<string, string> | undefined,
+      env: buildChildEnv(cfg.env),
       cwd: cfg.cwd,
     });
   }
@@ -190,21 +252,15 @@ function buildToolDefinition(
     name: publicName,
     description: tool.description ?? "",
     parameters: tool.inputSchema,
-    output: {
-      schema: {
-        type: "object",
-        properties: { content: { type: "array", items: {} } },
-      },
-      render(_args: any, value: any): any[] {
-        // render 必须返回 ContentBlocks 数组，不能返回纯字符串。
-        // DSH 的 contentHasImage 会递归对 tool-result 的 content 调用 .some()，
-        // 如果返回字符串会导致 "content.some is not a function" 错误，
-        // 且该错误会持久化到 session 日志中，导致后续每轮对话都失败。
-        const content = Array.isArray(value?.content) ? value.content : [];
-        return [{ type: "text", text: extractText(content, rawName) }];
-      },
-    },
+    output: createOutput(rawName, supportedOutputSchema(tool.outputSchema)),
     async execute(args: any, exec: any) {
+      // task-based 执行模式本桥不支持（与官方 dsh-mcp-client 一致），
+      // 提前给出明确错误而非调用后得到模糊失败。
+      if (tool?.execution?.taskSupport === "required") {
+        throw new Error(
+          `Tool "${rawName}" requires task-based execution, which this bridge does not support`
+        );
+      }
       const argObj = typeof args === "object" && args !== null ? args : {};
       let result: any;
       try {
@@ -251,9 +307,12 @@ function buildToolDefinition(
  * 同步一代 client 的工具列表到 agent 注册表。
  *
  * 两阶段保安全（与官方 syncTools 一致）：
- *   1. fetch：分页拉全 tools/list。任何失败直接抛出，上一代注册原样保留
- *      （断线期间旧工具保持注册——模型可见性不抖动，调用会失败等重连换新）。
- *   2. swap：dispose 上一代，注册新一代。单个工具注册失败记日志跳过（contain）。
+ *   1. fetch：分页拉全 tools/list，逐个构造注册定义；两个 raw name 归一化
+ *      撞出同一 public 名（server 非法工具列表）或任何失败直接抛出，
+ *      上一代注册原样保留（断线期间旧工具保持注册——模型可见性不抖动，
+ *      调用会失败等重连换新）。
+ *   2. swap：dispose 上一代，注册新一代；任一 register 抛错（如名字被
+ *      外来注册占用）则整代回滚——本 server 0 个工具，绝无半代状态。
  */
 async function syncTools(
   generation: Client,
@@ -264,14 +323,22 @@ async function syncTools(
   log: (msg: string) => void,
   onSessionLoss: (generation: Client) => void
 ): Promise<Map<string, () => void>> {
-  const tools: any[] = [];
+  const definitions = new Map<string, any>();
   let cursor: string | undefined;
   do {
     const resp = await generation.request(
       { method: "tools/list", ...(cursor === undefined ? {} : { params: { cursor } }) },
       ListToolsResultSchema
     );
-    tools.push(...resp.tools);
+    for (const tool of resp.tools) {
+      const publicName = publicToolName(serverName, tool.name);
+      if (definitions.has(publicName)) {
+        throw new Error(
+          `server "${serverName}": server 列出的工具 "${tool.name}" 与已有工具归一化后同名（${publicName}）——非法工具列表`
+        );
+      }
+      definitions.set(publicName, buildToolDefinition(generation, serverName, tool, cfg, onSessionLoss));
+    }
     cursor = resp.nextCursor;
   } while (cursor);
 
@@ -279,15 +346,16 @@ async function syncTools(
     try { d(); } catch { /* 忽略 */ }
   }
   const disposers = new Map<string, () => void>();
-  for (const tool of tools) {
-    try {
-      const d = agentCtx.tools.register(
-        buildToolDefinition(generation, serverName, tool, cfg, onSessionLoss)
-      );
-      disposers.set(publicToolName(serverName, tool.name), d);
-    } catch (e: any) {
-      log(`server "${serverName}" 工具 "${tool.name}" 注册失败: ${e?.message ?? e}`);
+  try {
+    for (const [publicName, definition] of definitions) {
+      disposers.set(publicName, agentCtx.tools.register(definition));
     }
+  } catch (e: any) {
+    for (const d of disposers.values()) {
+      try { d(); } catch { /* 忽略 */ }
+    }
+    log(`server "${serverName}": 工具注册失败，本代 0 个工具（已整代回滚）: ${e?.message ?? e}`);
+    return new Map();
   }
   log(`server "${serverName}": 注册 ${disposers.size} 个工具`);
   return disposers;

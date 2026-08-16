@@ -7,6 +7,7 @@
 - **首步可见**：agent 创建即连接注册，首个模型请求就含 `mcp__*` 工具（[ADR-0003](decisions/0003-created-timing.md)）
 - **断线自愈**：启动失败与中途断线自动重连 + 工具重注册（[ADR-0004](decisions/0004-reconnect-supervisor.md)，移植官方 dsh-mcp-client 的 supervisor）
 - **会话失效自愈**：streamable-http server 重启/会话驱逐后的 "Session not found" 主动判定断线并换代重连（[ADR-0005](decisions/0005-session-loss-detection.md)，官方 dsh-mcp-client 亦有此盲区，本插件先修）
+- **官方对齐**：stdio scrubbed 父环境继承、重复 raw name 守卫、注册冲突整代回滚、outputSchema→structuredContent 输出契约、taskSupport=required 明确拒绝（[ADR-0006](decisions/0006-official-parity.md)）
 
 ## 非目标
 
@@ -32,6 +33,8 @@ agent/disposed / fiber dispose：断开连接、卸载工具、清 watcher
 
 - 每个 server 一条受监督连接：重连预算（默认 10 次，500ms→30s 指数退避），连接存活 ≥ maxDelayMs 重置预算；耗尽后卸载该 server 全部工具并停止
 - 重连期间旧工具保持注册（模型可见性不抖动），但调用会失败直到换代完成
+- stdio 子进程环境 = scrubbed 父环境（剥凭据形状名与 `DSH_*`）+ yml `env` 覆盖层（[ADR-0006](decisions/0006-official-parity.md)，与全局 MCP 一致）
+- server 声明受支持的 outputSchema 时进 `structuredContent` 输出契约（required + additionalProperties:false）；重复 raw name / 注册名字被占 → 整代拒绝/回滚，不留半代状态
 - chokidar 监听配置文件，保存即重载（verbose 可看日志）
 - 无配置文件的目录不加载任何 MCP
 
