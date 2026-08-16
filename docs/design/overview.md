@@ -5,12 +5,12 @@
 - 按 workspace（session cwd）自动加载/卸载 MCP server：项目自己的 `.dsh/mcp.servers.yml` 只在自己的会话生效
 - MCP 工具注册到 agent scope，随 agent 生灭自动回收，不同项目互不干扰
 - **首步可见**：agent 创建即连接注册，首个模型请求就含 `mcp__*` 工具（[ADR-0003](decisions/0003-created-timing.md)）
+- **断线自愈**：启动失败与中途断线自动重连 + 工具重注册（[ADR-0004](decisions/0004-reconnect-supervisor.md)，移植官方 dsh-mcp-client 的 supervisor）
 
 ## 非目标
 
 - 不管理 DSH 全局 MCP 配置（那是 `dsh-mcp-client` patch 行的职责，本插件是它的 workspace 化包装）
 - 不改变工具命名规则（`mcp__<server>__<tool>` 由 dsh-tools 决定）
-- 不做 server 健康监控/自动重连（连接失败记日志，下次 pre-step 兜底重试）
 
 ## 工作原理
 
@@ -19,15 +19,18 @@ agent/created（global，fire-and-forget 异步连接）
   ↓
 读 <cwd>/<configFile>（默认 .dsh/mcp.servers.yml）
   ↓
-对每个 server：@modelcontextprotocol/sdk 连接 → 发现工具
-  ↓
-在 agent.ctx 注册工具（agent-scoped，随 agent 回收；disposer 插件自持）
+对每个 server：supervisor 受监督连接（@modelcontextprotocol/sdk）
+  连接 → 发现工具 → 在 agent.ctx 注册（agent-scoped，随 agent 回收）
+  断线（onclose）/ 启动失败 → 指数退避重连（换代新 client）→ 重新注册
+  toolListChanged 通知 → 工具列表重同步
   ↓
 agent/pre-step 兜底：HMR 重载后已存在 agent 没有 created 事件，补初始化
   ↓
 agent/disposed / fiber dispose：断开连接、卸载工具、清 watcher
 ```
 
+- 每个 server 一条受监督连接：重连预算（默认 10 次，500ms→30s 指数退避），连接存活 ≥ maxDelayMs 重置预算；耗尽后卸载该 server 全部工具并停止
+- 重连期间旧工具保持注册（模型可见性不抖动），但调用会失败直到换代完成
 - chokidar 监听配置文件，保存即重载（verbose 可看日志）
 - 无配置文件的目录不加载任何 MCP
 

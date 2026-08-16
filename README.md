@@ -24,9 +24,11 @@ servers:
       Authorization: "Bearer <token>"
 ```
 
-字段与 `@deepseek-ai/dsh-mcp-client` 对齐（`transport` / `command` / `args` / `env` / `url` / `headers` / `toolCallTimeoutMs`）。
+字段与 `@deepseek-ai/dsh-mcp-client` 对齐（`transport` / `command` / `args` / `env` / `url` / `headers` / `toolCallTimeoutMs` / `reconnect`）。
 
 - agent 创建即连接注册（`agent/created`），**首个模型请求就含这些工具**；headless "create 后立刻发消息" 的竞速场景第 1 步可能没有，第 2 步必有
+- **断线自动重连**（移植官方 dsh-mcp-client 的 supervisor）：启动失败与中途断线均按指数退避重连并重新注册工具；重连期间旧工具保持注册（调用会失败），server 恢复后自动换新。stdio = 重新 spawn，http = 重新握手
+- server 发 `toolListChanged` 通知时自动重同步工具列表
 - 改配置文件由 chokidar 监听，保存即重载；无该文件的目录不加载任何 MCP
 
 ## 安装
@@ -39,7 +41,7 @@ servers:
 dsh plugin --profile web add github:Momojie-S/dsh-workspace-mcp
 
 # 或 tarball（pnpm pack 产物，无授权要求）
-dsh plugin --profile web add momojie-s-dsh-workspace-mcp-0.1.0.tgz
+dsh plugin --profile web add momojie-s-dsh-workspace-mcp-0.2.0.tgz
 ```
 
 验证层就位后重启 DSH：
@@ -65,10 +67,30 @@ dsh web --dump-config | Select-String workspace-mcp   # 应看到对应层
 
 ## 配置
 
+插件级（patch `config` 字段）：
+
 | 字段 | 默认值 | 说明 |
 |------|--------|------|
 | `configFile` | `.dsh/mcp.servers.yml` | 相对 workspace 根的配置文件路径 |
 | `verbose` | `false` | 输出连接/注册详细日志，排查用 |
+| `reconnect.enabled` | `true` | 断线/启动失败是否自动重连 |
+| `reconnect.initialDelayMs` | `500` | 首次重连延迟，此后指数翻倍 |
+| `reconnect.maxDelayMs` | `30000` | 退避封顶；连接存活超此值则重置尝试预算（偶发崩的能无限恢复，crash-loop 的被掐掉） |
+| `reconnect.maxAttempts` | `10` | 一次断线周期内最大连续失败次数，耗尽后卸载该 server 全部工具；改配置文件或重启恢复 |
+
+per-server 覆盖（`.dsh/mcp.servers.yml`，同名项优先于插件级）：
+
+```yaml
+servers:
+  flaky:
+    transport: stdio
+    command: npx
+    args: ["-y", "some-mcp"]
+    reconnect:
+      enabled: true
+      initialDelayMs: 1000
+      maxAttempts: 5
+```
 
 ## 验证
 
@@ -79,6 +101,12 @@ mcp__<serverName>__<toolName>
 ```
 
 工具出现即生效；切到无配置的目录，这些工具不再出现，即隔离生效。
+
+断线重连的可执行验证（不经 DSH host）：
+
+```bash
+npm test   # 杀 server 子进程 → 自动重连恢复；启动失败 → 退避重试 → 放弃卸载
+```
 
 ---
 

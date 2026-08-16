@@ -20,6 +20,20 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import * as yaml from "js-yaml";
 
+/**
+ * 重连策略（与官方 dsh-mcp-client 的 reconnect 字段对齐）。
+ * 配置层只管 shape；默认值与边界判定在 mcp.ts 的 resolveReconnectPolicy。
+ */
+export interface ReconnectPolicy {
+  enabled: boolean;
+  /** 首次重连延迟（毫秒），此后指数翻倍。 */
+  initialDelayMs: number;
+  /** 退避封顶（毫秒）；也充当"健康稳定窗口"——连接存活超过它则重置尝试预算。 */
+  maxDelayMs: number;
+  /** 一次断线周期内最大连续失败尝试次数。 */
+  maxAttempts: number;
+}
+
 /** 单个 MCP server 的配置（与 dsh-mcp-client Config 字段对齐）。 */
 export interface ServerConfig {
   transport: "stdio" | "streamable-http";
@@ -31,6 +45,8 @@ export interface ServerConfig {
   headers?: Record<string, string>;
   /** 单次 callTool 超时（毫秒），默认 60000。 */
   toolCallTimeoutMs?: number;
+  /** 重连策略覆盖（逐项覆盖插件级配置，缺省回退插件级/内置默认）。 */
+  reconnect?: Partial<ReconnectPolicy>;
 }
 
 /** 项目级 MCP 配置文件根。 */
@@ -118,6 +134,47 @@ function validateServerConfig(filePath: string, name: string, cfg: any): ServerC
       throw new Error(`workspace-mcp: ${filePath} server "${name}" toolCallTimeoutMs 必须是正数`);
     }
     out.toolCallTimeoutMs = cfg.toolCallTimeoutMs;
+  }
+  if (cfg.reconnect !== undefined) {
+    out.reconnect = validateReconnect(cfg.reconnect, filePath, name);
+  }
+  return out;
+}
+
+/** 校验 per-server reconnect 覆盖块（shape 级；跨字段边界在 resolveReconnectPolicy 判）。 */
+function validateReconnect(
+  v: any,
+  filePath: string,
+  name: string
+): Partial<ReconnectPolicy> {
+  if (typeof v !== "object" || v === null) {
+    throw new Error(`workspace-mcp: ${filePath} server "${name}" reconnect 必须是 mapping`);
+  }
+  for (const key of Object.keys(v)) {
+    if (!["enabled", "initialDelayMs", "maxDelayMs", "maxAttempts"].includes(key)) {
+      throw new Error(`workspace-mcp: ${filePath} server "${name}" reconnect.${key} 不是合法字段`);
+    }
+  }
+  const out: Partial<ReconnectPolicy> = {};
+  if (v.enabled !== undefined) {
+    if (typeof v.enabled !== "boolean") {
+      throw new Error(`workspace-mcp: ${filePath} server "${name}" reconnect.enabled 必须是 boolean`);
+    }
+    out.enabled = v.enabled;
+  }
+  for (const key of ["initialDelayMs", "maxDelayMs"] as const) {
+    if (v[key] !== undefined) {
+      if (typeof v[key] !== "number" || !Number.isFinite(v[key]) || v[key] <= 0) {
+        throw new Error(`workspace-mcp: ${filePath} server "${name}" reconnect.${key} 必须是正数`);
+      }
+      out[key] = v[key];
+    }
+  }
+  if (v.maxAttempts !== undefined) {
+    if (typeof v.maxAttempts !== "number" || !Number.isInteger(v.maxAttempts) || v.maxAttempts < 1) {
+      throw new Error(`workspace-mcp: ${filePath} server "${name}" reconnect.maxAttempts 必须是正整数`);
+    }
+    out.maxAttempts = v.maxAttempts;
   }
   return out;
 }
