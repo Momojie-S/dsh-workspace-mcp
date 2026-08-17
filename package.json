@@ -18,9 +18,9 @@
   ],
   "license": "MIT",
   "scripts": {
-    "build": "tsc",
+    "build": "node scripts/build.mjs",
     "build:watch": "tsc --watch",
-    "prepare": "npm run build",
+    "prepare": "node scripts/build.mjs",
     "test": "node test/reconnect-smoke.mjs && node test/reconnect-giveup.mjs && node test/session-loss.mjs && node test/parity.mjs",
     "clean": "node -e \"require('fs').rmSync('lib',{recursive:true,force:true})\""
   },
