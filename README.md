@@ -138,4 +138,4 @@ npm test   # 杀 server 子进程 → 自动重连恢复；启动失败 → 退�
 
 ---
 
-设计文档见 [docs/design/overview.md](docs/design/overview.md)；官方 dsh-mcp-client（全局/profile 级）的配置见合集仓库 `docs/usage/official-mcp.md`。
+设计文档见 [docs/design/overview.md](docs/design/overview.md)；官方 dsh-mcp-client（全局/profile 级）的配置见合集仓库 `docs/official-usage/mcp.md`。
