@@ -34,6 +34,29 @@ servers:
 - server 发 `toolListChanged` 通知时自动重同步工具列表
 - 改配置文件由 chokidar 监听，保存即重载；无该文件的目录不加载任何 MCP
 
+### headless/tui profile 临时挂载
+
+这两个 profile 默认没挂 workspace-mcp，需要时用 `--patch` 临时挂 `file:///` 行指向其 lib（纯 host 半部插件可临时这样挂，带浏览器半部的插件不行）：
+
+```bash
+dsh --profile headless --patch <(echo "- insert:
+    - id: workspace-mcp
+      name: file:///D:/code/workspace/deepseek-harness-101/plugins/dsh-workspace-mcp/lib/index.js") "任务…"
+```
+
+### 与全局 MCP 的同名遮蔽（实测结论）
+
+两边工具名都是 `mcp__<serverName>__<tool>`，冲突语义来自 DSH 工具注册表——agent 作用域遮蔽全局（per-tool，按名字逐个遮蔽）：
+
+| 场景 | 行为 |
+|---|---|
+| serverName 不同 | 共存，两组工具模型都可见（正常用法） |
+| 同 serverName（工具名撞车） | 项目级赢：模型看到并调用的都是项目版（web 从第 1 步起；竞速输了的场景第 1 步可能暂用全局版，第 2 步起项目版）。全局版对没配此 server 的其它 workspace 不受影响 |
+| 全局 patch 里两条同 serverName | 后者整代注册回滚，日志报 `already registered`，该 server 一个工具都没有 |
+| 同一个 yml 里重复 server 键 | YAML 后键覆盖前键 |
+
+同名遮蔽是刻意覆盖的正规姿势（如把全局 server 指向本地 dev 实例调试）；无意撞名就改 serverName。若两边工具列表不完全一致，只有重名的那部分被遮蔽，其余各自可见。
+
 ## 安装
 
 本插件是**组合包**（`dsh.bundle`），用 `dsh plugin` 安装进 profile，自动追加配置层，无需手编 patch：
@@ -105,6 +128,8 @@ mcp__<serverName>__<toolName>
 
 工具出现即生效；切到无配置的目录，这些工具不再出现，即隔离生效。
 
+排障时挂载 config 开 `verbose: true`：连接/注册日志含 `[ws-mcp] server "xxx": 注册 N 个工具`（stdio 场景在 stderr）。
+
 断线重连的可执行验证（不经 DSH host）：
 
 ```bash
@@ -113,4 +138,4 @@ npm test   # 杀 server 子进程 → 自动重连恢复；启动失败 → 退�
 
 ---
 
-设计文档见 [docs/design/overview.md](docs/design/overview.md)；MCP 配置详解与踩坑见合集仓库 `docs/usage/mcp.md`。
+设计文档见 [docs/design/overview.md](docs/design/overview.md)；官方 dsh-mcp-client（全局/profile 级）的配置见合集仓库 `docs/usage/official-mcp.md`。
