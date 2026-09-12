@@ -4,7 +4,7 @@ DSH 插件：按 **workspace（session cwd）** 自动加载/卸载 MCP server�
 
 ## 环境要求
 
-- DSH `>= 0.1.0-rc.6`（已验证至 `0.1.1-rc.2`）
+- DSH `>= 0.1.0-rc.6`（已验证至 `0.1.5-rc.1`）
 
 ## 用法
 
