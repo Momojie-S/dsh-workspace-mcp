@@ -230,7 +230,10 @@ export class WorkspaceMcpRegistry {
     }
     if (!cfg) return; // ENOENT：无配置；watcher 已在位，文件出现后由 reload 落位
     for (const [serverName, serverCfg] of Object.entries(cfg.servers)) {
-      // 快速路径：簿记命中且连接健在且本 agent 已是订阅者 → 跳过
+      // 快速路径：簿记命中且连接健在且本 agent 已是订阅者 → 跳过。
+      // 局限注明（规格 §4.4 R6 附注的预授权退化）：此判据 = yml 期望集 vs 簿记 + 连接活性，
+      // 未枚举 cordis tools 实际注册面——簿记与注册面若失配（理论上已被入队即摘纪律压到最低），
+      // 此自检不可见，依赖日志与集成测试兜底。
       const existing = entry.subscriptions.get(serverName);
       if (
         existing &&

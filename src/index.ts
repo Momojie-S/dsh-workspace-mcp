@@ -8,7 +8,7 @@
  *     空↔非空跃迁），随后异步确保按 <cwd>/.dsh/mcp.servers.yml 订阅齐全。
  *   - agent/pre-step 自检自愈：每步幂等重跑 ensure（快速路径 = 簿记命中直接
  *     跳过），覆盖 HMR 重载后无 created 事件的存量 agent 与各类失明收敛。
- *   - 同一 workspace 的同一 server 条目全全体 agent 共享一条受监督连接
+ *   - 同一 workspace 的同一 server 条目全体 agent 共享一条受监督连接
  *     （registry.ts，含串行链/活性守卫/grace/dirty reload/对账义务）；
  *     工具注册依旧 per-agent——可见性、随 agent 卸载、workspace 隔离不变。
  *   - 重连预算耗尽（given-up）后，任一新 agent 订阅即重开预算重建，旧订阅者
