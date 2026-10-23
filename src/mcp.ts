@@ -19,6 +19,9 @@
  *   - 官方对齐补齐（ADR-0006）：stdio 子进程 scrubbed 父环境继承、重复 public 名
  *     守卫、注册冲突整代回滚、outputSchema→structuredContent 输出契约、
  *     taskSupport=required 明确拒绝
+ *   - stdio 树杀兜底（ADR-0007）：dispose 与连接失败路径对直接子进程
+ *     taskkill /T /F 整树击杀，补 SDK close 只杀单进程的缺口——多层命令链
+ *     （如 uvx→uv→exe→python）解析中不读 stdin，EOF 软回收够不着（Windows-only）
  */
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -33,6 +36,7 @@ import { assertSupportedJsonSchema } from "@deepseek-ai/dsh-tools";
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { ReconnectPolicy, ServerConfig } from "./config.js";
+import { killTree } from "./tree-kill.js";
 
 const MAX_PUBLIC_NAME_LENGTH = 64;
 const INVALID_NAME_CHARS = /[^A-Za-z0-9_-]/g;
@@ -384,6 +388,8 @@ export function startSupervisedConnection(
   let client: Client | undefined;
   /** 与 client 配对的关闭信号；dispose 抢先清空所有权前捕获。 */
   let clientClosed: Promise<void> | undefined;
+  /** 与 client 配对的当前代 transport；树杀兜底从它取直接子进程 pid。 */
+  let currentTransport: StdioClientTransport | StreamableHTTPClientTransport | undefined;
   /** 本 server 持有的工具注册（dispose 换代）；仅 enqueueSync 与 dispose 交换。 */
   let disposers = new Map<string, () => void>();
   let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
@@ -393,6 +399,10 @@ export function startSupervisedConnection(
   let connectedAt: number | undefined;
   /** 首次尝试的真实错误，供 ready 诊断。 */
   let firstAttemptError: unknown;
+
+  /** 从 transport 取直接子进程 pid（streamable-http 无 pid；stdio 未 start 时为 null）。 */
+  const pidOf = (t: typeof currentTransport): number | undefined =>
+    t && "pid" in t && typeof t.pid === "number" ? t.pid : undefined;
 
   /** 一代只在它仍是当前代且插件存活时才允许行动。 */
   const isCurrent = (generation: Client) => !disposed && client === generation;
@@ -418,6 +428,7 @@ export function startSupervisedConnection(
     if (!isCurrent(generation)) return;
     client = undefined;
     clientClosed = undefined;
+    currentTransport = undefined;
     scheduleReconnect();
   }
 
@@ -491,6 +502,7 @@ export function startSupervisedConnection(
       { name: "dsh-workspace-mcp", version: "0.1.0" },
       { capabilities: {} }
     );
+    const transport = createTransport(cfg);
     let resolveClose!: () => void;
     const closed = new Promise<void>((r) => { resolveClose = r; });
     let attemptSettled = false;
@@ -498,6 +510,7 @@ export function startSupervisedConnection(
     const hasClosed = () => closeObserved;
     client = generation;
     clientClosed = closed;
+    currentTransport = transport;
     generation.onclose = () => {
       closeObserved = true;
       resolveClose();
@@ -515,7 +528,7 @@ export function startSupervisedConnection(
       }
     });
     try {
-      await generation.connect(createTransport(cfg));
+      await generation.connect(transport);
       if (hasClosed()) {
         attemptSettled = true;
         generationDown(generation);
@@ -525,6 +538,10 @@ export function startSupervisedConnection(
     } catch (e: any) {
       if (firstAttemptError === undefined) firstAttemptError = e;
       if (isCurrent(generation)) log(`${label}: 连接尝试失败: ${e?.message ?? e}`);
+      // 树杀兜底先行：重试风暴下每个失败尝试都可能孤儿化一条解析中（不读 stdin）
+      // 的多层链；taskkill /T /F 覆盖 SDK close 够不着的后代。进程已死则空转无害。
+      const attemptPid = pidOf(transport);
+      if (attemptPid !== undefined) killTree(attemptPid);
       try { await generation.close(); } catch { /* 忽略 */ }
       const quiesced = hasClosed() || (await waitForClose(closed));
       attemptSettled = true;
@@ -566,9 +583,16 @@ export function startSupervisedConnection(
       }
       const current = client;
       const currentClosed = clientClosed;
+      const currentGenTransport = currentTransport;
       client = undefined;
       clientClosed = undefined;
+      currentTransport = undefined;
       if (current !== undefined) {
+        // 树杀兜底先行：EOF 软回收只对「健康且在读 stdin」的链有效，解析中途/
+        // 正忙/不读 stdin 的形态（ADR-0007）靠 taskkill /T /F 立即整树覆盖；
+        // 进程死后 close() 只做协议与流清理（closePromise 立即 resolve）。
+        const pid = pidOf(currentGenTransport);
+        if (pid !== undefined) killTree(pid);
         try { await current.close(); } catch { /* 忽略 */ }
         if (currentClosed !== undefined && !(await waitForClose(currentClosed))) {
           log(`${label}: dispose 时一代连接未在 ${GENERATION_CLOSE_TIMEOUT_MS}ms 内关闭，server 关闭可能不完整`);
