@@ -17,8 +17,11 @@
  */
 
 import { createServer } from "node:http";
+import { mkdtemp, mkdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import { startSupervisedConnection } from "../lib/mcp.js";
+import { WorkspaceMcpRegistry, connKeyOf } from "../lib/registry.js";
 
 // ---- 最小 streamable-http MCP server（无 GET SSE：一律 405，SDK 视为不支持） ----
 const state = {
@@ -163,26 +166,36 @@ async function pollUntil(fn, { timeoutMs, intervalMs = 100, what }) {
   throw new Error(`poll 超时（${what}）: ${lastError?.message ?? lastError ?? "条件未满足"}`);
 }
 
-const sup = startSupervisedConnection(
-  agentCtx,
-  "http",
-  { transport: "streamable-http", url, toolCallTimeoutMs: 5000 },
-  { enabled: true, initialDelayMs: 100, maxDelayMs: 400, maxAttempts: 8 },
-  log
-);
+const base = await mkdtemp(join(tmpdir(), "ws-mcp-sessionloss-"));
+const cwd = join(base, "ws");
+await mkdir(join(cwd, ".dsh"), { recursive: true });
+const registry = new WorkspaceMcpRegistry({
+  configFile: ".dsh/mcp.servers.yml",
+  log,
+  reloadDebounceMs: 500,
+  idleDropMs: 60_000,
+  reconnect: { enabled: true, initialDelayMs: 100, maxDelayMs: 400, maxAttempts: 8 },
+});
+const key = connKeyOf(resolve(cwd, ".dsh/mcp.servers.yml"), "http");
+
+registry.registerAgentPresence("agent-1", cwd, agentCtx);
+await registry.ensureAgentServersInline("agent-1", cwd, agentCtx, {
+  http: { transport: "streamable-http", url, toolCallTimeoutMs: 5000 },
+});
 
 const cleanup = async () => {
-  await sup.dispose().catch(() => {});
+  await registry.disposeAll().catch(() => {});
   httpServer.close();
+  await rm(base, { recursive: true, force: true }).catch(() => {});
 };
 process.on("exit", () => httpServer.close());
 
 // ---- 1. 初始连接 ----
 {
-  const ready = await sup.ready;
-  if (ready.error) {
+  const ready = await registry.readyOf(key);
+  if (!ready || ready.error) {
     await cleanup();
-    fail(`初始连接失败: ${ready.error?.message ?? ready.error}`);
+    fail(`初始连接失败: ${ready?.error?.message ?? ready ?? "ready 缺失"}`);
   }
   if (registered.size !== 1) {
     await cleanup();
@@ -262,7 +275,7 @@ process.on("exit", () => httpServer.close());
 }
 
 // ---- 5. dispose ----
-await sup.dispose();
+await registry.disposeAll();
 if (registered.size !== 0) {
   fail(`dispose 后应无注册工具，实际 ${registered.size}`);
 }

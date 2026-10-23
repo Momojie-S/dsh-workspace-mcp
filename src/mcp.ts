@@ -1,24 +1,27 @@
 /**
- * MCP server 受监督连接（supervisor）+ 工具发现 + agent-scoped 注册。
+ * MCP server 受监督连接（supervisor）+ 工具发现（fetch 层）。
  * 复用 @modelcontextprotocol/sdk，命名 mcp__<server>__<tool>（与 dsh-mcp-client 一致）。
  *
- * 连接监督机制移植自官方 @deepseek-ai/dsh-mcp-client 的 connection 模块：
+ * 方案C（ADR-0008）分层：本模块只负责「连接层」——一个 server 条目一条受监督
+ * 连接（同一 workspace 的全体 agent 共享），不再持有任何 agentCtx：
+ *   - 连接成功后 fetch 一代 tools/list（含 publicName 冲突守卫），把工具元数据
+ *     交给 registry（hooks.onFetched）分发到各订阅者注册（apply 在 registry.ts）；
+ *   - ToolListChanged → 重拉 → 再次 onFetched；
+ *   - 重连预算耗尽 → hooks.onGivenUp，registry 卸载全部订阅者的注册（订阅者
+ *     条目保留，重建后随共享恢复）。
+ * 监督机制移植自官方 @deepseek-ai/dsh-mcp-client 的 connection 模块：
  *   - 每次 attempt 一代全新 Client+transport（MCP SDK 把 Protocol 绑死在单个
  *     transport 上，重连必须换代，不能复用旧 client）
  *   - generation.onclose 驱动断线检测（stdio 子进程退出 / HTTP 连接断开）
  *   - 指数退避重连：initialDelayMs * 2^(n-1)，封顶 maxDelayMs
  *   - 一次断线共享一次尝试预算（maxAttempts）；连接存活 ≥ maxDelayMs 后预算
  *     重置——偶发崩溃的 server 能无限恢复，crash-loop 的会被掐掉
- *   - 预算耗尽：卸载该 server 全部工具并停止；改配置文件（watcher reload）
- *     或重启是唯一恢复路径
- *   - 监听 ToolListChangedNotification：server 热改工具列表即时重同步
  *   - close 竞态防护：失败一代 5s 内未确认关闭则停止重连，避免 stdio 进程重叠
  *   - 会话失效主动判定（ADR-0005）：streamable-http 的 server 重启/会话驱逐只表现为
  *     请求错误（HTTP 404 / "Session not found"），transport 不 close、onclose 永不
- *     触发；在工具调用与重同步失败路径上识别此类错误，主动换代重连
+ *     触发；在工具调用与重拉取失败路径上识别此类错误，主动换代重连
  *   - 官方对齐补齐（ADR-0006）：stdio 子进程 scrubbed 父环境继承、重复 public 名
- *     守卫、注册冲突整代回滚、outputSchema→structuredContent 输出契约、
- *     taskSupport=required 明确拒绝
+ *     守卫、outputSchema→structuredContent 输出契约、taskSupport=required 明确拒绝
  *   - stdio 树杀兜底（ADR-0007）：dispose 与连接失败路径对直接子进程
  *     taskkill /T /F 整树击杀，补 SDK close 只杀单进程的缺口——多层命令链
  *     （如 uvx→uv→exe→python）解析中不读 stdin，EOF 软回收够不着（Windows-only）
@@ -232,17 +235,35 @@ export function resolveReconnectPolicy(
   return merged;
 }
 
-/** 一个 server 的受监督连接句柄：自管理重连，dispose 时清理全部资源。 */
-export interface SupervisedServer {
-  serverName: string;
+/** registry 分发工具定义时的回调集（方案C：fetch 在连接层，apply 在注册层）。 */
+export interface SupervisionHooks {
+  /** 当前代 tools/list 已拉取（首连、重连成功、toolListChanged 重拉）。幂等分发。 */
+  onFetched(): void;
+  /** 重连预算耗尽：registry 卸载全部订阅者的注册（订阅者条目保留，重建后随共享恢复）。 */
+  onGivenUp(): void;
+}
+
+/** 一个 server 条目的共享连接监督句柄（无 agentCtx；多订阅者共用）。 */
+export interface Supervision {
+  readonly serverName: string;
   /** 首次连接尝试的结果（无论成败；重连在后台继续，不反映在此 promise）。 */
-  ready: Promise<{ error?: unknown }>;
-  /** 停止监督：断开当前连接、清重连计时器、卸载全部工具。幂等。 */
+  readonly ready: Promise<{ error?: unknown }>;
+  /** 当前代 client（连接中/已连接；退避等待、最终放弃、dispose 后为 undefined）。 */
+  getCurrentClient(): Client | undefined;
+  /** 当前代已拉取的工具元数据（tools/list 原始条目；未拉取过为 undefined）。 */
+  getCurrentTools(): readonly any[] | undefined;
+  /** 会话失效上报（execute 路径识别出 Session not found 类错误时调用）。 */
+  reportSessionLoss(generation: Client): void;
+  /** 停止监督：树杀兜底 + 断开当前连接、清重连计时器。幂等、不抛。 */
   dispose(): Promise<void>;
 }
 
-/** 为一个工具构造 agent-scoped 注册定义（execute 绑定所属代的 client）。 */
-function buildToolDefinition(
+/**
+ * 为一个工具构造订阅者作用域的注册定义（execute 绑定所属代的 client）。
+ * 方案C：registry 对每个订阅者重新调用本函数实例化（不跨订阅者共享定义对象
+ * ——register 纯度未证实，防挂元数据互相污染）。
+ */
+export function buildToolDefinition(
   generation: Client,
   serverName: string,
   tool: any,
@@ -308,26 +329,13 @@ function buildToolDefinition(
 }
 
 /**
- * 同步一代 client 的工具列表到 agent 注册表。
- *
- * 两阶段保安全（与官方 syncTools 一致）：
- *   1. fetch：分页拉全 tools/list，逐个构造注册定义；两个 raw name 归一化
- *      撞出同一 public 名（server 非法工具列表）或任何失败直接抛出，
- *      上一代注册原样保留（断线期间旧工具保持注册——模型可见性不抖动，
- *      调用会失败等重连换新）。
- *   2. swap：dispose 上一代，注册新一代；任一 register 抛错（如名字被
- *      外来注册占用）则整代回滚——本 server 0 个工具，绝无半代状态。
+ * 拉取一代工具列表（fetch 层，连接级一次）：分页 tools/list + publicName
+ * 冲突守卫。失败上抛由调用方按连接尝试失败处理；失败时上一代已注册的
+ * 工具原样保留（可见性不抖动，调用会失败等重连换新）。
  */
-async function syncTools(
-  generation: Client,
-  agentCtx: any,
-  serverName: string,
-  cfg: ServerConfig,
-  previous: Map<string, () => void>,
-  log: (msg: string) => void,
-  onSessionLoss: (generation: Client) => void
-): Promise<Map<string, () => void>> {
-  const definitions = new Map<string, any>();
+async function fetchTools(generation: Client, serverName: string): Promise<any[]> {
+  const tools: any[] = [];
+  const seen = new Set<string>();
   let cursor: string | undefined;
   do {
     const resp = await generation.request(
@@ -336,51 +344,33 @@ async function syncTools(
     );
     for (const tool of resp.tools) {
       const publicName = publicToolName(serverName, tool.name);
-      if (definitions.has(publicName)) {
+      if (seen.has(publicName)) {
         throw new Error(
           `server "${serverName}": server 列出的工具 "${tool.name}" 与已有工具归一化后同名（${publicName}）——非法工具列表`
         );
       }
-      definitions.set(publicName, buildToolDefinition(generation, serverName, tool, cfg, onSessionLoss));
+      seen.add(publicName);
+      tools.push(tool);
     }
     cursor = resp.nextCursor;
   } while (cursor);
-
-  for (const d of previous.values()) {
-    try { d(); } catch { /* 忽略 */ }
-  }
-  const disposers = new Map<string, () => void>();
-  try {
-    for (const [publicName, definition] of definitions) {
-      disposers.set(publicName, agentCtx.tools.register(definition));
-    }
-  } catch (e: any) {
-    for (const d of disposers.values()) {
-      try { d(); } catch { /* 忽略 */ }
-    }
-    log(`server "${serverName}": 工具注册失败，本代 0 个工具（已整代回滚）: ${e?.message ?? e}`);
-    return new Map();
-  }
-  log(`server "${serverName}": 注册 ${disposers.size} 个工具`);
-  return disposers;
+  return tools;
 }
 
 /**
- * 启动一个 MCP server 的受监督连接：连接 → 发现工具 → 注册到 agent 的
- * scoped tools 服务；断线/失败按 policy 指数退避重连并重新注册。
- *
- * 注意: agent.ctx 在 agent/created 时可能是 inactive，不能用 agentCtx.effect，
- * 所以返回 SupervisedServer，由调用方在 agent/disposed / reload 时 dispose。
+ * 启动一个 MCP server 条目的共享监督连接（连接层，无 agentCtx）：
+ * 连接 → fetch 工具 → hooks.onFetched 交 registry 分发订阅者；断线/失败按
+ * policy 指数退避重连并重新 fetch；预算耗尽 → hooks.onGivenUp。
  *
  * @returns 监督句柄（不抛错；失败走重连策略，ready 携带首试结果）。
  */
-export function startSupervisedConnection(
-  agentCtx: any,
+export function startSupervision(
   serverName: string,
   cfg: ServerConfig,
   policy: ReconnectPolicy,
+  hooks: SupervisionHooks,
   log: (msg: string) => void
-): SupervisedServer {
+): Supervision {
   const label = `server "${serverName}"`;
 
   let disposed = false;
@@ -390,12 +380,12 @@ export function startSupervisedConnection(
   let clientClosed: Promise<void> | undefined;
   /** 与 client 配对的当前代 transport；树杀兜底从它取直接子进程 pid。 */
   let currentTransport: StdioClientTransport | StreamableHTTPClientTransport | undefined;
-  /** 本 server 持有的工具注册（dispose 换代）；仅 enqueueSync 与 dispose 交换。 */
-  let disposers = new Map<string, () => void>();
+  /** 当前代已拉取的工具元数据；未拉取过/断线后为 undefined。 */
+  let currentTools: any[] | undefined;
   let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   /** 本次断线周期内连续失败的尝试次数。 */
   let failedAttempts = 0;
-  /** 当前代完成 connect + 首次同步的时刻；断线期间为 undefined。 */
+  /** 当前代完成 connect + 首次 fetch 的时刻；断线期间为 undefined。 */
   let connectedAt: number | undefined;
   /** 首次尝试的真实错误，供 ready 诊断。 */
   let firstAttemptError: unknown;
@@ -404,24 +394,8 @@ export function startSupervisedConnection(
   const pidOf = (t: typeof currentTransport): number | undefined =>
     t && "pid" in t && typeof t.pid === "number" ? t.pid : undefined;
 
-  /** 一代只在它仍是当前代且插件存活时才允许行动。 */
+  /** 一代只在它仍是当前代且句柄存活时才允许行动。 */
   const isCurrent = (generation: Client) => !disposed && client === generation;
-
-  /**
-   * 串行化所有 syncTools 调用（首同步 + 跨代通知重同步），两次同步的
-   * 换代交换永不交错（否则会双重 dispose 一代、泄漏另一代）。
-   */
-  let syncChain: Promise<void> = Promise.resolve();
-  function enqueueSync(generation: Client): Promise<void> {
-    const run = syncChain.then(async () => {
-      if (!isCurrent(generation)) return;
-      disposers = await syncTools(
-        generation, agentCtx, serverName, cfg, disposers, log, reportSessionLoss
-      );
-    });
-    syncChain = run.catch(() => {});
-    return run;
-  }
 
   /** 每代一次断线判定：isCurrent 守卫让竞速的 close/error 信号幂等。 */
   function generationDown(generation: Client): void {
@@ -429,11 +403,12 @@ export function startSupervisedConnection(
     client = undefined;
     clientClosed = undefined;
     currentTransport = undefined;
+    currentTools = undefined;
     scheduleReconnect();
   }
 
   /**
-   * 会话失效上报：execute / 重同步在已建立的一代上识别出 "Session not found"
+   * 会话失效上报：execute / 重拉取在已建立的一代上识别出 "Session not found"
    * 类错误时调用。等价断线判定——streamable-http 的 transport 在 server 重启/
    * 会话驱逐后不会自己 close，onclose 永不触发，必须在此主动换代；旧代后台
    * 关闭（其 onclose 因 isCurrent 已失而幂等无害）。并发多个调用同时失败时，
@@ -462,8 +437,8 @@ export function startSupervisedConnection(
     const lostEstablished = connectedAt !== undefined;
     if (!policy.enabled) {
       const message = lostEstablished
-        ? "连接断开且重连已禁用——已注册工具将持续失败，改配置文件或重启可恢复"
-        : "连接失败且重连已禁用——未注册任何工具，改配置文件或重启可重试";
+        ? "连接断开且重连已禁用——工具调用将持续失败，改配置文件或重启可恢复"
+        : "连接失败且重连已禁用——无可用工具，改配置文件或重启可重试";
       log(`${label}: ${message}`);
       return;
     }
@@ -474,13 +449,9 @@ export function startSupervisedConnection(
     connectedAt = undefined;
     failedAttempts += 1;
     if (failedAttempts > policy.maxAttempts) {
-      syncChain = syncChain.then(() => {
-        for (const d of disposers.values()) {
-          try { d(); } catch { /* 忽略 */ }
-        }
-        disposers = new Map();
-      });
-      log(`${label}: 连续 ${policy.maxAttempts} 次重连失败，放弃——工具已全部卸载；改配置文件或重启可重试`);
+      currentTools = undefined;
+      hooks.onGivenUp();
+      log(`${label}: 连续 ${policy.maxAttempts} 次重连失败，放弃——已卸载订阅者的工具（订阅者保留）；新订阅或配置重载将重开预算`);
       return;
     }
     const delayMs = Math.min(policy.maxDelayMs, policy.initialDelayMs * 2 ** (failedAttempts - 1));
@@ -494,8 +465,8 @@ export function startSupervisedConnection(
   }
 
   /**
-   * 一次连接尝试：全新 transport + client，connect 后排队首次工具同步。
-   * 所有失败汇入 generationDown；成功则武装 onclose 驱动的断线路径。永不 reject。
+   * 一次连接尝试：全新 transport + client，connect 后 fetch 工具并交 registry
+   * 分发。所有失败汇入 generationDown；成功则武装 onclose 驱动的断线路径。永不 reject。
    */
   async function connectGeneration(): Promise<void> {
     const generation = new Client(
@@ -518,13 +489,16 @@ export function startSupervisedConnection(
     };
     generation.setNotificationHandler(ToolListChangedNotificationSchema, async () => {
       if (!isCurrent(generation)) return;
-      log(`${label}: 工具列表变化，重新同步`);
+      log(`${label}: 工具列表变化，重新拉取`);
       try {
-        await enqueueSync(generation);
+        const tools = await fetchTools(generation, serverName);
+        if (!isCurrent(generation)) return;
+        currentTools = tools;
+        hooks.onFetched();
       } catch (e: any) {
         if (disposed) return;
         if (isSessionLossError(e)) reportSessionLoss(generation);
-        else log(`${label}: 工具重同步失败: ${e?.message ?? e}`);
+        else log(`${label}: 工具重拉取失败: ${e?.message ?? e}`);
       }
     });
     try {
@@ -534,7 +508,10 @@ export function startSupervisedConnection(
         generationDown(generation);
         return;
       }
-      await enqueueSync(generation);
+      const tools = await fetchTools(generation, serverName);
+      if (!isCurrent(generation)) return;
+      currentTools = tools;
+      hooks.onFetched();
     } catch (e: any) {
       if (firstAttemptError === undefined) firstAttemptError = e;
       if (isCurrent(generation)) log(`${label}: 连接尝试失败: ${e?.message ?? e}`);
@@ -549,6 +526,7 @@ export function startSupervisedConnection(
       if (!quiesced) {
         client = undefined;
         clientClosed = undefined;
+        currentTools = undefined;
         log(`${label}: 失败一代未在 ${GENERATION_CLOSE_TIMEOUT_MS}ms 内关闭——为避免 server 进程重叠，停止重连；改配置文件或重启可重试`);
         return;
       }
@@ -563,7 +541,7 @@ export function startSupervisedConnection(
     if (!isCurrent(generation)) return;
     connectedAt = Date.now();
     if (failedAttempts > 0) {
-      log(`${label}: 重连成功，工具已重新同步（第 ${failedAttempts}/${policy.maxAttempts} 次尝试）`);
+      log(`${label}: 重连成功，工具已重新分发（第 ${failedAttempts}/${policy.maxAttempts} 次尝试）`);
     }
   }
 
@@ -575,6 +553,9 @@ export function startSupervisedConnection(
       if (client !== undefined) return {};
       return { error: firstAttemptError ?? new Error(`${label}: 初始连接失败`) };
     }),
+    getCurrentClient: () => client,
+    getCurrentTools: () => currentTools,
+    reportSessionLoss,
     async dispose() {
       disposed = true;
       if (reconnectTimer !== undefined) {
@@ -587,6 +568,7 @@ export function startSupervisedConnection(
       client = undefined;
       clientClosed = undefined;
       currentTransport = undefined;
+      currentTools = undefined;
       if (current !== undefined) {
         // 树杀兜底先行：EOF 软回收只对「健康且在读 stdin」的链有效，解析中途/
         // 正忙/不读 stdin 的形态（ADR-0007）靠 taskkill /T /F 立即整树覆盖；
@@ -599,11 +581,6 @@ export function startSupervisedConnection(
         }
       }
       await settling;
-      await syncChain;
-      for (const d of disposers.values()) {
-        try { d(); } catch { /* 忽略 */ }
-      }
-      disposers = new Map();
     },
   };
 }

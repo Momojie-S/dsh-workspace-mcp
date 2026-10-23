@@ -9,5 +9,8 @@ Thumbs.db
 # 临时文件与过程性材料（探针脚本、本地实验）
 .temp/
 
+# 测试运行时生成的临时 fixture（shared-giveup-retry 动态写入）
+test/fixtures/late-server.mjs
+
 # dsh workspace-env（本地凭据，绝不入库）
 .env

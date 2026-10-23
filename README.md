@@ -99,10 +99,11 @@ dsh web --dump-config | Select-String workspace-mcp   # 应看到对应层
 |------|--------|------|
 | `configFile` | `.dsh/mcp.servers.yml` | 相对 workspace 根的配置文件路径 |
 | `verbose` | `false` | 输出连接/注册详细日志，排查用 |
+| `idleDropMs` | `30000` | 连接的最后一名订阅者离开后的保留宽限；0 = 立即回收（不推荐——单 agent 正常退出也会杀掉 server，丢热态） |
 | `reconnect.enabled` | `true` | 断线/启动失败是否自动重连 |
 | `reconnect.initialDelayMs` | `500` | 首次重连延迟，此后指数翻倍 |
 | `reconnect.maxDelayMs` | `30000` | 退避封顶；连接存活超此值则重置尝试预算（偶发崩的能无限恢复，crash-loop 的被掐掉） |
-| `reconnect.maxAttempts` | `10` | 一次断线周期内最大连续失败次数，耗尽后卸载该 server 全部工具；改配置文件或重启恢复 |
+| `reconnect.maxAttempts` | `10` | 一次断线周期内最大连续失败次数，耗尽后卸载该 server 全部订阅者的工具；任一新 agent 订阅或改配置文件即重开预算重试 |
 
 per-server 覆盖（`.dsh/mcp.servers.yml`，同名项优先于插件级）：
 

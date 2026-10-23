@@ -1,5 +1,5 @@
 /**
- * 官方对齐（parity）测试（ADR-0006）：不经 DSH host，直接驱动 lib/mcp.js。
+ * 官方对齐（parity）测试（ADR-0006）：经 registry 入口直驱 supervisor。
  *
  * 覆盖从官方 dsh-mcp-client 补齐移植的五个行为：
  *   A. 重复 public 名守卫：server 列出两个归一化后同名的工具 → 拒绝整代，0 注册
@@ -10,12 +10,17 @@
  *   E. stdio scrubbed 父环境继承：普通父变量可见 / DSH_* 剥离 /
  *      凭据形状名剥离但显式 env 覆盖可传
  *
+ * 各场景使用独立 cwd（独立 pathKey → 独立连接），场景间互不共享。
+ *
  * 运行: node test/parity.mjs（需先 npm run build）
  */
 
 import { createServer } from "node:http";
+import { mkdtemp, mkdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { startSupervisedConnection } from "../lib/mcp.js";
+import { WorkspaceMcpRegistry, connKeyOf } from "../lib/registry.js";
 
 // ---- E 段准备：往测试进程（=supervisor 宿主）注入探针变量 ----
 // （必须在子进程 spawn 之前：子进程 env 在 spawn 时定格）
@@ -136,7 +141,7 @@ const httpServer = createServer((req, res) => {
       return;
     }
     res.writeHead(404, { "content-type": "application/json" });
-    res.end(JSON.stringify({ jsonrpc: "2.0", id: body.id, error: { code: -32600, message: "Session not found" } }));
+    res.end(JSON.stringify({ jsonrpc: "2.0", id: "server-error", error: { code: -32600, message: "Session not found" } }));
   });
 });
 
@@ -167,19 +172,56 @@ function mockAgentCtx(registerImpl) {
   };
 }
 
+// ---- 每场景独立 registry（旧测试语义：各 sup 完全独立、dispose 互不影响）----
 const fastPolicy = { enabled: true, initialDelayMs: 100, maxDelayMs: 400, maxAttempts: 3 };
+const scenarioDirs = [];
+let scenarioSeq = 0;
+let activeRegistry;
+
+/** 场景级驱动：独立 cwd + 独立 registry + inline 配置 → 旧式 { ready, dispose } 句柄。 */
+async function driveSup(agentCtx, serverName, cfg) {
+  activeRegistry = new WorkspaceMcpRegistry({
+    configFile: ".dsh/mcp.servers.yml",
+    log,
+    reloadDebounceMs: 500,
+    idleDropMs: 60_000,
+    reconnect: fastPolicy,
+  });
+  const registry = activeRegistry;
+  const base = await mkdtemp(join(tmpdir(), "ws-mcp-parity-"));
+  const cwd = join(base, "ws");
+  await mkdir(join(cwd, ".dsh"), { recursive: true });
+  scenarioDirs.push(base);
+  const agentId = `parity-${++scenarioSeq}`;
+  registry.registerAgentPresence(agentId, cwd, agentCtx);
+  await registry.ensureAgentServersInline(agentId, cwd, agentCtx, { [serverName]: cfg });
+  const key = connKeyOf(resolve(cwd, ".dsh/mcp.servers.yml"), serverName);
+  return {
+    ready: registry.readyOf(key),
+    async dispose() {
+      await registry.disposeAll();
+    },
+  };
+}
+
+async function cleanupAll() {
+  await activeRegistry?.disposeAll().catch(() => {});
+  for (const dir of scenarioDirs) {
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+  httpServer.close();
+}
+process.on("exit", () => httpServer.close());
 
 // ---- A. 重复 raw name → 拒绝整代；归一化有损但不同名 → 哈希防坍缩 ----
 {
   state.toolset = "duplicate";
   const { ctx, registered } = mockAgentCtx();
-  const sup = startSupervisedConnection(
-    ctx, "dup", { transport: "streamable-http", url }, fastPolicy, log
-  );
+  const sup = await driveSup(ctx, "dup", { transport: "streamable-http", url });
   const ready = await sup.ready;
-  if (!ready.error || !/归一化后同名|more than once/.test(String(ready.error.message))) {
+  if (!ready || !ready.error || !/归一化后同名|more than once/.test(String(ready.error.message))) {
     await sup.dispose();
-    fail(`重复名应以归一化同名错误失败，实际: ${ready.error?.message ?? ready.error}`);
+    fail(`重复名应以归一化同名错误失败，实际: ${ready?.error?.message ?? ready ?? "ready 缺失"}`);
   }
   if (registered.size !== 0) {
     await sup.dispose();
@@ -191,13 +233,11 @@ const fastPolicy = { enabled: true, initialDelayMs: 100, maxDelayMs: 400, maxAtt
   // 归一化有损（非法字符）但 raw name 不同 → 身份哈希后缀防坍缩
   state.toolset = "lossy";
   const { ctx: ctx2, registered: registered2 } = mockAgentCtx();
-  const sup2 = startSupervisedConnection(
-    ctx2, "lossy", { transport: "streamable-http", url }, fastPolicy, log
-  );
+  const sup2 = await driveSup(ctx2, "lossy", { transport: "streamable-http", url });
   const ready2 = await sup2.ready;
-  if (ready2.error) {
+  if (!ready2 || ready2.error) {
     await sup2.dispose();
-    fail(`lossy toolset 连接失败: ${ready2.error?.message}`);
+    fail(`lossy toolset 连接失败: ${ready2?.error?.message ?? ready2 ?? "ready 缺失"}`);
   }
   const names = [...registered2.keys()];
   if (names.length !== 2 || names[0] === names[1]) {
@@ -216,13 +256,11 @@ const fastPolicy = { enabled: true, initialDelayMs: 100, maxDelayMs: 400, maxAtt
 {
   state.toolset = "normal";
   const { ctx, registered } = mockAgentCtx();
-  const sup = startSupervisedConnection(
-    ctx, "meta", { transport: "streamable-http", url }, fastPolicy, log
-  );
+  const sup = await driveSup(ctx, "meta", { transport: "streamable-http", url });
   const ready = await sup.ready;
-  if (ready.error) {
+  if (!ready || ready.error) {
     await sup.dispose();
-    fail(`normal toolset 连接失败: ${ready.error?.message}`);
+    fail(`normal toolset 连接失败: ${ready?.error?.message ?? ready ?? "ready 缺失"}`);
   }
   if (registered.size !== 3) {
     await sup.dispose();
@@ -288,9 +326,7 @@ const fastPolicy = { enabled: true, initialDelayMs: 100, maxDelayMs: 400, maxAtt
   const { ctx, registered } = mockAgentCtx((def) => {
     if (def.name === "mcp__meta__structured") throw new Error("namespace squatted");
   });
-  const sup = startSupervisedConnection(
-    ctx, "meta", { transport: "streamable-http", url }, fastPolicy, log
-  );
+  const sup = await driveSup(ctx, "meta", { transport: "streamable-http", url });
   await sup.ready;
   if (registered.size !== 0) {
     await sup.dispose();
@@ -303,7 +339,7 @@ const fastPolicy = { enabled: true, initialDelayMs: 100, maxDelayMs: 400, maxAtt
 // ---- E. stdio scrubbed 父环境继承 ----
 {
   const { ctx, registered } = mockAgentCtx();
-  const sup = startSupervisedConnection(
+  const sup = await driveSup(
     ctx,
     "probe",
     {
@@ -313,14 +349,12 @@ const fastPolicy = { enabled: true, initialDelayMs: 100, maxDelayMs: 400, maxAtt
       // 显式 env 覆盖 scrub：敏感名也允许显式传（merge 在 scrub 之后）
       env: { PARITY_SECRET_TOKEN: "explicit-pass" },
       toolCallTimeoutMs: 5000,
-    },
-    fastPolicy,
-    log
+    }
   );
   const ready = await sup.ready;
-  if (ready.error) {
+  if (!ready || ready.error) {
     await sup.dispose();
-    fail(`probe 连接失败: ${ready.error?.message}`);
+    fail(`probe 连接失败: ${ready?.error?.message ?? ready ?? "ready 缺失"}`);
   }
   const getenv = async (name) => {
     const r = await registered.get("mcp__probe__getenv").execute({ name }, {});
@@ -352,6 +386,6 @@ const fastPolicy = { enabled: true, initialDelayMs: 100, maxDelayMs: 400, maxAtt
   log("E OK: 父环境继承 + DSH_*/凭据形状名 scrub + 显式覆盖优先");
 }
 
-httpServer.close();
+await cleanupAll();
 console.log("PASS: 官方对齐五项（重复名守卫/输出契约/taskSupport/整代回滚/scrubbed env）全链路通过");
 process.exit(0);

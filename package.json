@@ -21,7 +21,7 @@
     "build": "node scripts/build.mjs",
     "build:watch": "tsc --watch",
     "prepare": "node scripts/build.mjs",
-    "test": "node test/reconnect-smoke.mjs && node test/reconnect-giveup.mjs && node test/session-loss.mjs && node test/parity.mjs && node test/tree-kill.mjs",
+    "test": "node test/reconnect-smoke.mjs && node test/reconnect-giveup.mjs && node test/session-loss.mjs && node test/parity.mjs && node test/tree-kill.mjs && node test/shared-share.mjs && node test/shared-isolation.mjs && node test/shared-concurrent-subscribe.mjs && node test/shared-lifecycle.mjs && node test/shared-hotadd.mjs && node test/shared-toollistchanged.mjs && node test/shared-multi-server-partial-remove.mjs && node test/shared-reload.mjs && node test/shared-race-unsubscribe-apply.mjs && node test/shared-race-dispose-queue.mjs && node test/shared-giveup-retry.mjs && node test/shared-fiber-dispose.mjs",
     "clean": "node -e \"require('fs').rmSync('lib',{recursive:true,force:true})\""
   },
   "dsh": {

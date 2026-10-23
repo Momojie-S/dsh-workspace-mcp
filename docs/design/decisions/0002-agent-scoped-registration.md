@@ -1,6 +1,6 @@
 # ADR-0002：工具注册到 agent scope，而非全局
 
-状态：accepted（2026-08）
+状态：accepted（2026-08）；**连接生命周期部分被 [ADR-0008](0008-shared-connections.md) 修订（2026-10-23）**——「agent 结束自动卸载、连接自动断开」中的连接存活改为引用计数（最后一个订阅者离开 + grace 后断开），工具注册 per-agent 不变。
 
 ## 背景
 
