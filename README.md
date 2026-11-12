@@ -27,8 +27,8 @@ servers:
 字段与 `@deepseek-ai/dsh-mcp-client` 对齐（`transport` / `command` / `args` / `env` / `url` / `headers` / `toolCallTimeoutMs` / `reconnect`）。
 
 - agent 创建即连接注册（`agent/created`），**首个模型请求就含这些工具**；headless "create 后立刻发消息" 的竞速场景第 1 步可能没有，第 2 步必有
-- **断线自动重连**（移植官方 dsh-mcp-client 的 supervisor）：启动失败与中途断线均按指数退避重连并重新注册工具；重连期间旧工具保持注册（调用会失败），server 恢复后自动换新。stdio = 重新 spawn，http = 重新握手
-- **会话失效自愈**（≥0.2.1，官方 client 尚无此能力）：streamable-http server 重启/会话驱逐后的 `Session not found` 类错误自动判定断线并换代重连，无需手动"强制重连"
+- **断线自动重连**（移植官方 dsh-mcp-client 的 supervisor）：启动失败与中途断线均按指数退避重连并重新注册工具；重连期间旧工具保持注册，server 恢复后自动换新。stdio = 重新 spawn，http = 重新握手
+- **重启自愈（调用内重试，≥0.4.0，官方 client 尚无此能力）**：streamable-http server 重启后的调用失败按「可证明未触达工具执行」分类——会话失效（HTTP 404 / JSON-RPC -32001 / "Session not found" 文案）、server 不可达（502/503、ECONNREFUSED/ENOTFOUND/EAI_AGAIN）——命中即丢弃当前连接、等新连接就绪（预算 `min(toolCallTimeoutMs, 30s)`）后**在同一次调用内重试一次，模型无感知**；并发调用撞同一重启共享一次重建。ECONNRESET、超时、abort、504 与业务错误刻意不重试（请求可能已到达 server，重放有重复执行风险），原样上抛
 - **stdio 环境继承**（≥0.3.0，与全局 MCP 一致）：子进程拿到 scrubbed 父环境（剥 `KEY|PASSWORD|SECRET|TOKEN` 命中名与 `DSH_*` 前缀名）+ yml `env` 覆盖层——需要父环境变量（如 `PYTHONPATH`）的 server 直接工作；yml `env` 是覆盖层不是完整环境
 - server 声明受支持的 `outputSchema` 时进入 `structuredContent` 输出契约；非法工具列表 / 注册名冲突整代拒绝/回滚（≥0.3.0，官方对齐）
 - server 发 `toolListChanged` 通知时自动重同步工具列表
@@ -131,10 +131,10 @@ mcp__<serverName>__<toolName>
 
 排障时挂载 config 开 `verbose: true`：连接/注册日志含 `[ws-mcp] server "xxx": 注册 N 个工具`（stdio 场景在 stderr）。
 
-断线重连的可执行验证（不经 DSH host）：
+断线重连与重启自愈的可执行验证（不经 DSH host）：
 
 ```bash
-npm test   # 杀 server 子进程 → 自动重连恢复；启动失败 → 退避重试 → 放弃卸载；Session not found → 换代重连；官方对齐五项（env 继承/输出契约等）
+npm test   # 错误分类（33 用例）/ 杀 server 子进程自动重连 / 启动失败退避后放弃 / Session not found 调用内恢复 / ECONNREFUSED 重启窗口恢复 + 预算耗尽抛原始错误 + 超时不重试 + 并发共享重建 / 官方对齐五项
 ```
 
 ---

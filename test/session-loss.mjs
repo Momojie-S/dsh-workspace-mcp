@@ -9,8 +9,9 @@
  *   1. 初始连接（initialize #1）→ echo 工具注册
  *   2. echo 调用正常
  *   3. server 清空全部会话（模拟重启/空闲驱逐）→ echo 调用收到 404
- *      "Session not found"（复刻真实报文）→ 应自动重连（initialize #2）恢复
- *   4. 偶发 500 不触发换代（initialize 计数不变，同会话继续可用）
+ *      "Session not found"（复刻真实报文）→ 调用内自动换代重试成功，
+ *      调用方无感知（ADR-0009；initialize 恰好 +1）
+ *   4. 偶发 500 不触发换代也不重试（initialize 计数不变，同会话继续可用）
  *   5. dispose → 工具卸载
  *
  * 运行: node test/session-loss.mjs（需先 npm run build）
@@ -218,34 +219,25 @@ process.on("exit", () => httpServer.close());
   log("步骤2 OK: echo 调用正常，无多余握手");
 }
 
-// ---- 3. server 清空会话 → "Session not found" → 自动换代重连 ----
+// ---- 3. server 清空会话 → "Session not found" → 调用内自动恢复（ADR-0009） ----
 {
   state.sessions.clear(); // 模拟 server 重启 / 会话空闲驱逐：旧 session id 全部作废
-  let staleError;
-  try {
-    await callEcho("stale");
-  } catch (e) {
-    staleError = e;
-  }
-  if (!staleError || !/Session not found/.test(String(staleError.message))) {
+  const t0 = Date.now();
+  const text = await callEcho("stale");
+  const elapsed = Date.now() - t0;
+  if (text !== "echo: stale") {
     await cleanup();
-    fail(`旧会话调用应以 Session not found 失败，实际: ${staleError?.message ?? staleError}`);
-  }
-  log("步骤3a OK: 旧会话调用收到 Session not found（本次失败上抛）");
-
-  const text = await pollUntil(() => callEcho("after-reconnect"), {
-    timeoutMs: 20000,
-    what: "会话失效后自动重连恢复",
-  });
-  if (text !== "echo: after-reconnect") {
-    await cleanup();
-    fail(`重连后 echo 返回异常: ${text}`);
+    fail(`调用内恢复后 echo 返回异常: ${text}`);
   }
   if (state.initializeCount !== 2) {
     await cleanup();
     fail(`会话失效应触发恰好一次重新握手（initialize #2），实际 #${state.initializeCount}`);
   }
-  log("步骤3b OK: 会话失效自动判定断线 → 换代重连（initialize #2）→ 工具恢复");
+  if (elapsed > 2000) {
+    await cleanup();
+    fail(`调用内恢复应在退避 100ms + 握手内完成（<2s），实际 ${elapsed}ms`);
+  }
+  log(`步骤3 OK: 旧会话 404 → 调用内换代重试成功（${elapsed}ms，initialize #2），调用方无感知`);
 }
 
 // ---- 4. 偶发 500 不触发换代 ----

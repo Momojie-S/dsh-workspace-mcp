@@ -17,9 +17,11 @@
  *   - 一次断线共享一次尝试预算（maxAttempts）；连接存活 ≥ maxDelayMs 后预算
  *     重置——偶发崩溃的 server 能无限恢复，crash-loop 的会被掐掉
  *   - close 竞态防护：失败一代 5s 内未确认关闭则停止重连，避免 stdio 进程重叠
- *   - 会话失效主动判定（ADR-0005）：streamable-http 的 server 重启/会话驱逐只表现为
- *     请求错误（HTTP 404 / "Session not found"），transport 不 close、onclose 永不
- *     触发；在工具调用与重拉取失败路径上识别此类错误，主动换代重连
+ *   - 会话失效主动判定（ADR-0005）+ 调用内重启自愈（ADR-0009）：streamable-http
+ *     的 server 重启/会话驱逐只表现为请求错误（HTTP 404 / "Session not found"），
+ *     transport 不 close、onclose 永不触发；调用与重拉取失败路径按 diagnostic
+ *     分类识别此类「可证明未触达工具执行」的失败，主动换代重连，且原调用在
+ *     同一次 execute 内等新代就绪后重试一次——调用方（模型）无感知
  *   - 官方对齐补齐（ADR-0006）：stdio 子进程 scrubbed 父环境继承、重复 public 名
  *     守卫、outputSchema→structuredContent 输出契约、taskSupport=required 明确拒绝
  *   - stdio 树杀兜底（ADR-0007）：dispose 与连接失败路径对直接子进程
@@ -39,7 +41,10 @@ import { assertSupportedJsonSchema } from "@deepseek-ai/dsh-tools";
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { ReconnectPolicy, ServerConfig } from "./config.js";
+import { classifyRestartRecovery, isSessionLossError } from "./diagnostic.js";
 import { killTree } from "./tree-kill.js";
+
+export { isSessionLossError };
 
 const MAX_PUBLIC_NAME_LENGTH = 64;
 const INVALID_NAME_CHARS = /[^A-Za-z0-9_-]/g;
@@ -51,6 +56,12 @@ const GENERATION_CLOSE_TIMEOUT_MS = 5_000;
 const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
 
 /**
+ * 调用内恢复等待新代连接就绪的预算上限（ADR-0009）：实际取
+ * min(toolCallTimeoutMs, 本值)——工具调用超时本来就更短时尊重它。
+ */
+const RECOVERY_RECONNECT_BUDGET_MS = 30_000;
+
+/**
  * 宽松结果校验 schema：信任 MCP server 返回的 JSON，只做 record(shape) 校验，
  * 不让 SDK 用 CallToolResultSchema 预校验（否则遇到结构化/兼容结果会失败）。
  * 与官方 dsh-mcp-client 的 RawCallToolResultSchema 一致。
@@ -58,24 +69,24 @@ const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
 const RawCallToolResultSchema = z.record(z.string(), z.unknown());
 
 /**
- * 会话失效文案特征：覆盖官方 SDK server（"Session not found"）、FastMCP 系
- * （"Session has expired"）及常见变体。HTTP 404 单独成条件（MCP streamable-http
- * 规范里 404 = 会话未知/已终止；StreamableHTTPError.code 即 HTTP 状态码）。
+ * 给一个 promise 加截止时间（ADR-0009）：超时 reject，原 promise 的
+ * settle 照常传递。用于恢复等待新代的预算控制。
  */
-const SESSION_LOSS_MESSAGE_PATTERN =
-  /session not found|session (has )?expired|invalid or expired session|unknown session/i;
-
-/**
- * 判断一个错误是否表明 server 侧会话已失效（server 重启 / 会话驱逐 / 重新部署）。
- *
- * 此类错误只会让当次请求失败——transport 不 close、onclose 永不触发，supervisor
- * 若无人上报就永远不知道会话已死（工具持续失败直到改配置或重启）。保守匹配：
- * 偶发 5xx、超时等瞬时错误不在此列，不应触发换代。
- */
-export function isSessionLossError(error: unknown): boolean {
-  if (!(error instanceof Error)) return false;
-  if ((error as any).code === 404) return true;
-  return SESSION_LOSS_MESSAGE_PATTERN.test(error.message ?? "");
+function withDeadline<T>(p: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`等待超过 ${ms}ms 预算`)), ms);
+    timer.unref?.();
+    p.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      }
+    );
+  });
 }
 
 /**
@@ -252,23 +263,35 @@ export interface Supervision {
   getCurrentClient(): Client | undefined;
   /** 当前代已拉取的工具元数据（tools/list 原始条目；未拉取过为 undefined）。 */
   getCurrentTools(): readonly any[] | undefined;
-  /** 会话失效上报（execute 路径识别出 Session not found 类错误时调用）。 */
-  reportSessionLoss(generation: Client): void;
+  /**
+   * 带重启自愈的调用桥（ADR-0009）：operation 在当前代上执行；失败命中
+   * classifyRestartRecovery 分类时丢弃当前代、等新代就绪（预算
+   * min(timeoutMs, 30s)）后重试一次——调用方无感知。并发撞上同一重启的
+   * 调用共享一次重建；不可恢复失败、重连放弃/超时、dispose 均原样上抛。
+   */
+  invokeWithRecovery<T>(
+    what: string,
+    timeoutMs: number,
+    operation: (client: Client) => Promise<T>
+  ): Promise<T>;
   /** 停止监督：树杀兜底 + 断开当前连接、清重连计时器。幂等、不抛。 */
   dispose(): Promise<void>;
 }
 
 /**
- * 为一个工具构造订阅者作用域的注册定义（execute 绑定所属代的 client）。
- * 方案C：registry 对每个订阅者重新调用本函数实例化（不跨订阅者共享定义对象
- * ——register 纯度未证实，防挂元数据互相污染）。
+ * 为一个工具构造订阅者作用域的注册定义。方案C：registry 对每个订阅者重新
+ * 调用本函数实例化（不跨订阅者共享定义对象——register 纯度未证实，防挂
+ * 元数据互相污染）。
+ *
+ * execute 不闭包捕获注册时的那代 client（ADR-0009）：调用经 supervision 的
+ * invokeWithRecovery 转发到调用时刻的当前代——换代后旧注册的 execute 依然
+ * 可用，且失败时自动走重启自愈（换代 → 等新代 → 重试一次）。
  */
 export function buildToolDefinition(
-  generation: Client,
+  invoke: Supervision["invokeWithRecovery"],
   serverName: string,
   tool: any,
-  cfg: ServerConfig,
-  onSessionLoss: (generation: Client) => void
+  cfg: ServerConfig
 ): any {
   const publicName = publicToolName(serverName, tool.name);
   const rawName = tool.name;
@@ -287,20 +310,18 @@ export function buildToolDefinition(
         );
       }
       const argObj = typeof args === "object" && args !== null ? args : {};
-      let result: any;
-      try {
-        result = await generation.request(
-          { method: "tools/call", params: { name: rawName, arguments: argObj } },
-          RawCallToolResultSchema,
-          { signal: exec?.signal, timeout: timeoutMs }
-        );
-      } catch (e) {
-        // 会话失效（如 server 重启后的 "Session not found"）不会触发 onclose，
-        // 必须在此上报 supervisor 换代重连；错误本身照常上抛——本次调用失败，
-        // 重连成功后模型重试即命中新会话。
-        if (isSessionLossError(e)) onSessionLoss(generation);
-        throw e;
-      }
+      // 重启自愈内置在 invokeWithRecovery：Session not found / server 不可达
+      // 类失败会在内部换代重试一次，此处不再需要单独的会话失效上报。
+      const result: any = await invoke(
+        `tool "${rawName}" 调用`,
+        timeoutMs,
+        (generation) =>
+          generation.request(
+            { method: "tools/call", params: { name: rawName, arguments: argObj } },
+            RawCallToolResultSchema,
+            { signal: exec?.signal, timeout: timeoutMs }
+          )
+      );
       // MCP 返回的 content 可能不是数组（某些 server 返回 toolResult / 其他结构），
       // 与官方 dsh-mcp-client 一致：归一化为标准 content 数组。
       if (!Array.isArray(result?.content)) {
@@ -389,6 +410,76 @@ export function startSupervision(
   let connectedAt: number | undefined;
   /** 首次尝试的真实错误，供 ready 诊断。 */
   let firstAttemptError: unknown;
+  /**
+   * 重启自愈等待者（ADR-0009）：invokeWithRecovery 丢弃当前代后在此排队，
+   * 等下一个已连接的新代 settle；重连放弃/停止/dispose 时以错误 settle。
+   */
+  const generationWaiters = new Set<{
+    promise: Promise<Client>;
+    resolve: (client: Client) => void;
+    reject: (error: unknown) => void;
+  }>();
+
+  /**
+   * 被主动 close 的代（forceReconnect 触发）。SDK 的 Client.close() 会同步
+   * 把该代仍在飞行中的请求 reject 为 McpError(-32000, "Connection closed")
+   * ——这些并发调用是 close 的受害者，而 close 的前提是并发的另一个调用已
+   * 证实 session 死亡 / server 不可达（server 侧必然同样在入口拒绝），对
+   * 它们豁免重试是安全的。除主动 close 外的 -32000（如 stdio 进程死亡时
+   * 的 onclose 连锁）不在此列——请求可能已被执行，维持不可重试。
+   */
+  const forceClosedGenerations = new WeakSet<Client>();
+
+  /** SDK 的连接关闭连锁错误：McpError(-32000, "Connection closed")。 */
+  function isConnectionClosedError(e: unknown): boolean {
+    return (
+      typeof e === "object" &&
+      e !== null &&
+      (e as any).code === -32000 &&
+      /connection closed/i.test(String((e as any).message ?? ""))
+    );
+  }
+
+  /** 手写 deferred（target ES2022 无 Promise.withResolvers 类型）。 */
+  function deferredClient(): {
+    promise: Promise<Client>;
+    resolve: (client: Client) => void;
+    reject: (error: unknown) => void;
+  } {
+    let resolve!: (client: Client) => void;
+    let reject!: (error: unknown) => void;
+    const promise = new Promise<Client>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return { promise, resolve, reject };
+  }
+
+  /**
+   * 等待「晚于恢复触发代」的已连接代：当前代已连接则立即满足（并发撞同一
+   * 重启的后续调用者：别人已重建完成，直接用）；否则入队，由
+   * settleGenerationWaiters 在新代连接成功 / 重连停止时 settle。
+   */
+  function waitForFreshGeneration(): Promise<Client> {
+    const record = client;
+    if (record !== undefined && connectedAt !== undefined) {
+      return Promise.resolve(record);
+    }
+    const waiter = deferredClient();
+    generationWaiters.add(waiter);
+    return waiter.promise;
+  }
+
+  /** settle 全部等待者：record 已连接 → resolve；否则 reject(error)。 */
+  function settleGenerationWaiters(record: Client | undefined, error?: unknown): void {
+    if (generationWaiters.size === 0) return;
+    const waiters = [...generationWaiters];
+    generationWaiters.clear();
+    for (const waiter of waiters) {
+      if (record !== undefined && connectedAt !== undefined) waiter.resolve(record);
+      else waiter.reject(error ?? new Error(`${label}: 重连停止，未能得到新连接`));
+    }
+  }
 
   /** 从 transport 取直接子进程 pid（streamable-http 无 pid；stdio 未 start 时为 null）。 */
   const pidOf = (t: typeof currentTransport): number | undefined =>
@@ -408,17 +499,60 @@ export function startSupervision(
   }
 
   /**
-   * 会话失效上报：execute / 重拉取在已建立的一代上识别出 "Session not found"
-   * 类错误时调用。等价断线判定——streamable-http 的 transport 在 server 重启/
-   * 会话驱逐后不会自己 close，onclose 永不触发，必须在此主动换代；旧代后台
-   * 关闭（其 onclose 因 isCurrent 已失而幂等无害）。并发多个调用同时失败时，
-   * isCurrent 守卫保证只有第一个生效。
+   * 主动换代：调用路径识别出重启类失败（会话失效 / server 不可达）时调用。
+   * 等价断线判定——streamable-http 的 transport 在 server 重启/会话驱逐后
+   * 不会自己 close，onclose 永不触发，必须在此主动换代；旧代后台关闭（其
+   * onclose 因 isCurrent 已失而幂等无害）。并发多个调用同时失败时，
+   * isCurrent 守卫保证只有第一个生效——后来者直接进等待队列共享同一次重建。
    */
-  function reportSessionLoss(generation: Client): void {
+  function forceReconnect(generation: Client, kind: string): void {
     if (!isCurrent(generation)) return;
-    log(`${label}: server 会话已失效（如 Session not found），判定断线并重连`);
+    log(`${label}: ${kind} 类失败，判定断线并换代重连`);
+    forceClosedGenerations.add(generation);
     generation.close().catch(() => {});
     generationDown(generation);
+  }
+
+  /**
+   * 带重启自愈的调用桥（ADR-0009）：operation 在当前代上执行，失败命中
+   * classifyRestartRecovery 分类时丢弃当前代、复用既有重连循环重建，等新代
+   * 就绪（预算 min(timeoutMs, 30s)）后重试一次——调用方无感知。分类保证
+   * 失败可证明未触达工具执行，重放不可能重复非幂等工具；ECONNRESET、超时、
+   * abort、504 等不分类，原样上抛。重连放弃/预算耗尽/dispose 时上抛原始
+   * 调用错误（对模型更有用）；第二次失败同样原样上抛。
+   */
+  async function invokeWithRecovery<T>(
+    what: string,
+    timeoutMs: number,
+    operation: (client: Client) => Promise<T>
+  ): Promise<T> {
+    const first = client;
+    if (first === undefined || connectedAt === undefined) {
+      throw new Error(`${label}: server 未连接（重连中或已放弃），本次调用失败`);
+    }
+    try {
+      return await operation(first);
+    } catch (e) {
+      let kind = classifyRestartRecovery(e);
+      if (kind === undefined && forceClosedGenerations.has(first) && isConnectionClosedError(e)) {
+        // 主动 close 的连锁 reject：并发的另一个调用已证实重启（session 死 /
+        // 不可达），本请求在 server 侧必然同样未执行——按 session-lost 恢复
+        kind = "session-lost";
+      }
+      if (kind === undefined || disposed) throw e;
+      log(`${label}: ${what} 命中 ${kind} 类失败（${(e as any)?.message ?? e}），丢弃当前连接并重试一次`);
+      forceReconnect(first, kind);
+      const budgetMs = Math.min(timeoutMs, RECOVERY_RECONNECT_BUDGET_MS);
+      let fresh: Client | undefined;
+      try {
+        fresh = await withDeadline(waitForFreshGeneration(), budgetMs);
+      } catch {
+        // 重连放弃/停止/等待超预算——原始错误比等待失败原因更有用
+        throw e;
+      }
+      if (fresh === undefined || fresh === first) throw e;
+      return await operation(fresh);
+    }
   }
 
   /** 等 transport 自己的关闭信号，坏 transport 不至于把 teardown 挂死。 */
@@ -440,6 +574,7 @@ export function startSupervision(
         ? "连接断开且重连已禁用——工具调用将持续失败，改配置文件或重启可恢复"
         : "连接失败且重连已禁用——无可用工具，改配置文件或重启可重试";
       log(`${label}: ${message}`);
+      settleGenerationWaiters(undefined, new Error(`${label}: ${message}`));
       return;
     }
     // 稳定窗口：连接存活 ≥ maxDelayMs 视为健康，断线重开一次全新预算
@@ -452,6 +587,7 @@ export function startSupervision(
       currentTools = undefined;
       hooks.onGivenUp();
       log(`${label}: 连续 ${policy.maxAttempts} 次重连失败，放弃——已卸载订阅者的工具（订阅者保留）；新订阅或配置重载将重开预算`);
+      settleGenerationWaiters(undefined, new Error(`${label}: 连续 ${policy.maxAttempts} 次重连失败，放弃重连`));
       return;
     }
     const delayMs = Math.min(policy.maxDelayMs, policy.initialDelayMs * 2 ** (failedAttempts - 1));
@@ -497,7 +633,10 @@ export function startSupervision(
         hooks.onFetched();
       } catch (e: any) {
         if (disposed) return;
-        if (isSessionLossError(e)) reportSessionLoss(generation);
+        // 重拉取失败与工具调用同源：命中重启类分类（会话失效 / server 不可达）
+        // 即主动换代（无调用方可等待，重拉由新代的 onFetched 天然重做）
+        const kind = classifyRestartRecovery(e);
+        if (kind !== undefined) forceReconnect(generation, kind);
         else log(`${label}: 工具重拉取失败: ${e?.message ?? e}`);
       }
     });
@@ -528,6 +667,7 @@ export function startSupervision(
         clientClosed = undefined;
         currentTools = undefined;
         log(`${label}: 失败一代未在 ${GENERATION_CLOSE_TIMEOUT_MS}ms 内关闭——为避免 server 进程重叠，停止重连；改配置文件或重启可重试`);
+        settleGenerationWaiters(undefined, new Error(`${label}: 失败一代未确认关闭，停止重连`));
         return;
       }
       generationDown(generation);
@@ -543,6 +683,8 @@ export function startSupervision(
     if (failedAttempts > 0) {
       log(`${label}: 重连成功，工具已重新分发（第 ${failedAttempts}/${policy.maxAttempts} 次尝试）`);
     }
+    // 新代已连接且工具已拉取：唤醒全部恢复等待者（ADR-0009）
+    settleGenerationWaiters(generation);
   }
 
   let settling = connectGeneration();
@@ -555,9 +697,10 @@ export function startSupervision(
     }),
     getCurrentClient: () => client,
     getCurrentTools: () => currentTools,
-    reportSessionLoss,
+    invokeWithRecovery,
     async dispose() {
       disposed = true;
+      settleGenerationWaiters(undefined, new Error(`${label}: 连接已销毁`));
       if (reconnectTimer !== undefined) {
         clearTimeout(reconnectTimer);
         reconnectTimer = undefined;

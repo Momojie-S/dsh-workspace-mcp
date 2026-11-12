@@ -6,7 +6,7 @@
 - MCP 工具注册到 agent scope，随 agent 生灭自动回收，不同项目互不干扰
 - **首步可见**：agent 创建即连接注册，首个模型请求就含 `mcp__*` 工具（[ADR-0003](decisions/0003-created-timing.md)）
 - **断线自愈**：启动失败与中途断线自动重连 + 工具重注册（[ADR-0004](decisions/0004-reconnect-supervisor.md)，移植官方 dsh-mcp-client 的 supervisor）
-- **会话失效自愈**：streamable-http server 重启/会话驱逐后的 "Session not found" 主动判定断线并换代重连（[ADR-0005](decisions/0005-session-loss-detection.md)，官方 dsh-mcp-client 亦有此盲区，本插件先修）
+- **重启自愈（调用内）**：streamable-http server 重启/会话驱逐后的调用失败按「可证明未触达工具执行」分类（404/-32001 会话失效、502/503、ECONNREFUSED 等），命中即丢弃当前代、等新代就绪后在**同一次调用内重试一次**——模型无感知；ECONNRESET/超时/abort/504 及业务错误刻意不重试（[ADR-0009](decisions/0009-invoke-restart-recovery.md)，判定机制基于 [ADR-0005](decisions/0005-session-loss-detection.md)，官方 dsh-mcp-client 无此能力）
 - **官方对齐**：stdio scrubbed 父环境继承、重复 raw name 守卫、注册冲突整代回滚、outputSchema→structuredContent 输出契约、taskSupport=required 明确拒绝（[ADR-0006](decisions/0006-official-parity.md)）
 - **连接共享**：同一 workspace 的同一 server 条目只保留一份 server 进程，全体 agent 共用——进程份数不随会话/子 agent 数膨胀（[ADR-0008](decisions/0008-shared-connections.md)）
 
@@ -24,7 +24,10 @@ agent/created（global） / agent/pre-step（自检自愈，幂等）
   ↓ 对每个 server 条目：连接注册表 get-or-create（键 = normalize(path)+serverName）
 共享连接层（每条目一份，全体 agent 共用）：
   连接 → fetch 工具（tools/list + 冲突守卫）→ 分发到各订阅者（per-agent 注册）
-  断线（onclose / 会话失效识别）/ 启动失败 → 指数退避重连（换代新 client）→ 重新分发
+  断线（onclose / 重启类调用失败分类）/ 启动失败 → 指数退避重连（换代新 client）→ 重新分发
+  调用失败命中重启分类（404 会话失效 / 502/503 / ECONNREFUSED 等）→
+    丢弃当前代 → 等新代就绪（预算 min(toolCallTimeoutMs, 30s)）→
+    同一次调用内重试一次（模型无感知）；并发调用共享一次重建
   toolListChanged 通知 → 重拉 → 重分发
   重连预算耗尽（given-up）→ 卸载订阅者工具（条目保留）；新订阅重开预算重建 → 旧订阅者随共享恢复
   dispose/删除条目 → 树杀兜底（ADR-0007）
@@ -40,7 +43,9 @@ path 级（每配置文件一份）：
 ```
 
 - 连接级状态变更全部入连接串行链（任务执行先过活性守卫）；path 级状态触点全在同步段——并发纪律详见 [ADR-0008](decisions/0008-shared-connections.md)
-- 重连期间旧工具保持注册（模型可见性不抖动），但调用会失败直到换代完成
+- 重连期间旧工具保持注册（模型可见性不抖动）；调用走 supervisor 的恢复桥——
+  命中重启分类的在换代后自动重试一次，不可恢复类（ECONNRESET/超时等）原样
+  上抛、由模型自行处置
 - stdio 子进程环境 = scrubbed 父环境（剥凭据形状名与 `DSH_*`）+ yml `env` 覆盖层（[ADR-0006](decisions/0006-official-parity.md)，与全局 MCP 一致）
 - server 声明受支持的 outputSchema 时进 `structuredContent` 输出契约（required + additionalProperties:false）；重复 raw name / 注册名字被占 → 整代拒绝/回滚，不留半代状态
 - 无配置文件的目录不加载任何 MCP

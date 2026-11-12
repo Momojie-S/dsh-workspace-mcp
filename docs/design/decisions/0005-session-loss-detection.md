@@ -1,6 +1,6 @@
 # ADR-0005：会话失效主动判定（"Session not found" 盲区）
 
-状态：accepted（2026-08）
+状态：accepted（2026-08；2026-11 由 [ADR-0009](0009-invoke-restart-recovery.md) 演进为「判定 + 调用内重试」，本文件的判定机制仍是其基础）
 
 ## 背景
 

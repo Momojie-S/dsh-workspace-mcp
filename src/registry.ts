@@ -455,9 +455,7 @@ export class WorkspaceMcpRegistry {
         }
         built.set(
           publicName,
-          buildToolDefinition(client, conn.serverName, tool, conn.cfg, (gen) =>
-            conn.supervision.reportSessionLoss(gen)
-          )
+          buildToolDefinition(conn.supervision.invokeWithRecovery, conn.serverName, tool, conn.cfg)
         );
       }
     } catch (e: any) {
