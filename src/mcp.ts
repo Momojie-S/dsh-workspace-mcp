@@ -50,6 +50,14 @@ const MAX_PUBLIC_NAME_LENGTH = 64;
 const INVALID_NAME_CHARS = /[^A-Za-z0-9_-]/g;
 const HASH_LENGTH = 12;
 
+/**
+ * server instructions 的 UTF-8 字节上限（与官方 dsh-mcp-client 的
+ * DEFAULT_MAX_INSTRUCTION_BYTES 一致，per-server 可经 maxInstructionBytes 覆盖）。
+ * 超限按该次连接尝试失败处理（走既有重连路径）——对齐官方语义：
+ * 过长 instructions 是反模式，宁可连接失败也不塞进 system prompt。
+ */
+export const DEFAULT_MAX_INSTRUCTION_BYTES = 32_768;
+
 /** 失败一代等待 transport 确认关闭的上限（防僵死挂起 teardown）。 */
 const GENERATION_CLOSE_TIMEOUT_MS = 5_000;
 /** Node setTimeout 的合法上限。 */
@@ -264,6 +272,13 @@ export interface Supervision {
   /** 当前代已拉取的工具元数据（tools/list 原始条目；未拉取过为 undefined）。 */
   getCurrentTools(): readonly any[] | undefined;
   /**
+   * 最后一次成功连接的 server instructions（`### MCP server: <名>` 包装，UTF-8
+   * 字节计超限截断不存在——超限按连接失败处理）。断线不清空、重连成功后更新
+   * （与官方 dsh-mcp-client 的 serverInstructions 快照语义一致）；server 未声明
+   * 或从未连成时为空串。供 systemPrompt section 的 text 惰性读取。
+   */
+  getInstructions(): string;
+  /**
    * 带重启自愈的调用桥（ADR-0009）：operation 在当前代上执行；失败命中
    * classifyRestartRecovery 分类时丢弃当前代、等新代就绪（预算
    * min(timeoutMs, 30s)）后重试一次——调用方无感知。并发撞上同一重启的
@@ -403,6 +418,12 @@ export function startSupervision(
   let currentTransport: StdioClientTransport | StreamableHTTPClientTransport | undefined;
   /** 当前代已拉取的工具元数据；未拉取过/断线后为 undefined。 */
   let currentTools: any[] | undefined;
+  /**
+   * 最后一次成功连接的 instructions 快照（`### MCP server: <名>` 包装；server
+   * 未声明或从未连成为空串）。断线不清空、重连成功后整体替换——section 的
+   * text 惰性读取本值，重连换代后内容自动跟上（与官方 dsh-mcp-client 一致）。
+   */
+  let serverInstructions = "";
   let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   /** 本次断线周期内连续失败的尝试次数。 */
   let failedAttempts = 0;
@@ -647,9 +668,21 @@ export function startSupervision(
         generationDown(generation);
         return;
       }
+      // 握手结果里的 server instructions（官方对齐：connect 成功后立即取，
+      // 包装成 `### MCP server: <名>`；空声明 → 空串；超上限按本连接失败处理）。
+      const instructionsText = generation.getInstructions()?.trimEnd() ?? "";
+      const instructions =
+        instructionsText ? `### MCP server: ${serverName}\n\n${instructionsText}` : "";
+      const maxInstructionBytes = cfg.maxInstructionBytes ?? DEFAULT_MAX_INSTRUCTION_BYTES;
+      if (Buffer.byteLength(instructions, "utf8") > maxInstructionBytes) {
+        throw new Error(
+          `${label}: server instructions 超过 maxInstructionBytes（${maxInstructionBytes}，${Buffer.byteLength(instructions, "utf8")} 字节）`
+        );
+      }
       const tools = await fetchTools(generation, serverName);
       if (!isCurrent(generation)) return;
       currentTools = tools;
+      serverInstructions = instructions;
       hooks.onFetched();
     } catch (e: any) {
       if (firstAttemptError === undefined) firstAttemptError = e;
@@ -697,6 +730,7 @@ export function startSupervision(
     }),
     getCurrentClient: () => client,
     getCurrentTools: () => currentTools,
+    getInstructions: () => serverInstructions,
     invokeWithRecovery,
     async dispose() {
       disposed = true;

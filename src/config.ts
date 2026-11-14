@@ -45,6 +45,11 @@ export interface ServerConfig {
   headers?: Record<string, string>;
   /** 单次 callTool 超时（毫秒），默认 60000。 */
   toolCallTimeoutMs?: number;
+  /**
+   * server instructions 的 UTF-8 字节上限（默认 32768，与官方 dsh-mcp-client
+   * 一致）。握手返回的 instructions 包装后超此上限 → 该次连接按失败处理（走重连）。
+   */
+  maxInstructionBytes?: number;
   /** 重连策略覆盖（逐项覆盖插件级配置，缺省回退插件级/内置默认）。 */
   reconnect?: Partial<ReconnectPolicy>;
 }
@@ -134,6 +139,18 @@ function validateServerConfig(filePath: string, name: string, cfg: any): ServerC
       throw new Error(`workspace-mcp: ${filePath} server "${name}" toolCallTimeoutMs 必须是正数`);
     }
     out.toolCallTimeoutMs = cfg.toolCallTimeoutMs;
+  }
+  if (cfg.maxInstructionBytes !== undefined) {
+    if (
+      typeof cfg.maxInstructionBytes !== "number" ||
+      !Number.isInteger(cfg.maxInstructionBytes) ||
+      cfg.maxInstructionBytes < 1
+    ) {
+      throw new Error(
+        `workspace-mcp: ${filePath} server "${name}" maxInstructionBytes 必须是正整数`
+      );
+    }
+    out.maxInstructionBytes = cfg.maxInstructionBytes;
   }
   if (cfg.reconnect !== undefined) {
     out.reconnect = validateReconnect(cfg.reconnect, filePath, name);

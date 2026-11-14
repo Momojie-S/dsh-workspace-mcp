@@ -11,6 +11,10 @@
  *   - 同一 workspace 的同一 server 条目全体 agent 共享一条受监督连接
  *     （registry.ts，含串行链/活性守卫/grace/dirty reload/对账义务）；
  *     工具注册依旧 per-agent——可见性、随 agent 卸载、workspace 隔离不变。
+ *   - server instructions（握手返回）注入订阅者 agent 的 system prompt：
+ *     per-agent scoped section（`mcp:<server>`，MCP_SERVERS 排序位，字面文本），
+ *     经 agentCtx 访问使 section 落进该 agent 的 scope layer；快照语义与官方
+ *     dsh-mcp-client 对齐（最后成功连接为准、32KB 上限、超限连接失败），见 ADR-0010。
  *   - 重连预算耗尽（given-up）后，任一新 agent 订阅即重开预算重建，旧订阅者
  *     随共享恢复工具；配置文件变化经 watcher 触发 path 级 reload（dirty 补跑
  *     循环 + liveAgents×yml 重挂枚举 + 收尾三件事）。

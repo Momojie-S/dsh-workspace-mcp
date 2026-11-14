@@ -24,9 +24,10 @@ servers:
       Authorization: "Bearer <token>"
 ```
 
-字段与 `@deepseek-ai/dsh-mcp-client` 对齐（`transport` / `command` / `args` / `env` / `url` / `headers` / `toolCallTimeoutMs` / `reconnect`）。
+字段与 `@deepseek-ai/dsh-mcp-client` 对齐（`transport` / `command` / `args` / `env` / `url` / `headers` / `toolCallTimeoutMs` / `maxInstructionBytes` / `reconnect`）。
 
 - agent 创建即连接注册（`agent/created`），**首个模型请求就含这些工具**；headless "create 后立刻发消息" 的竞速场景第 1 步可能没有，第 2 步必有
+- **server instructions 注入 system prompt（≥0.5.0，与全局 MCP 一致）**：握手返回的 server instructions 以 `### MCP server: <名>` 包装，注册为该 agent 的 system prompt section（`mcp:<server>` 名、`MCP_SERVERS` 排序位、字面文本不做变量插值）。跨工具全局口径（坐标格式、分辨率等）server 侧声明一次即可见；此前走本插件时这段文字会被丢弃（全局 dsh-mcp-client 会注入，行为现已对齐）。断线不清快照、重连成功后自动更新；超 `maxInstructionBytes`（默认 32KB，官方同款上限）按该次连接失败处理走重连
 - **断线自动重连**（移植官方 dsh-mcp-client 的 supervisor）：启动失败与中途断线均按指数退避重连并重新注册工具；重连期间旧工具保持注册，server 恢复后自动换新。stdio = 重新 spawn，http = 重新握手
 - **重启自愈（调用内重试，≥0.4.0，官方 client 尚无此能力）**：streamable-http server 重启后的调用失败按「可证明未触达工具执行」分类——会话失效（HTTP 404 / JSON-RPC -32001 / "Session not found" 文案）、server 不可达（502/503、ECONNREFUSED/ENOTFOUND/EAI_AGAIN）——命中即丢弃当前连接、等新连接就绪（预算 `min(toolCallTimeoutMs, 30s)`）后**在同一次调用内重试一次，模型无感知**；并发调用撞同一重启共享一次重建。ECONNRESET、超时、abort、504 与业务错误刻意不重试（请求可能已到达 server，重放有重复执行风险），原样上抛
 - **stdio 环境继承**（≥0.3.0，与全局 MCP 一致）：子进程拿到 scrubbed 父环境（剥 `KEY|PASSWORD|SECRET|TOKEN` 命中名与 `DSH_*` 前缀名）+ yml `env` 覆盖层——需要父环境变量（如 `PYTHONPATH`）的 server 直接工作；yml `env` 是覆盖层不是完整环境
@@ -113,6 +114,7 @@ servers:
     transport: stdio
     command: npx
     args: ["-y", "some-mcp"]
+    maxInstructionBytes: 65536   # server instructions 字节上限（默认 32768）
     reconnect:
       enabled: true
       initialDelayMs: 1000
@@ -134,7 +136,7 @@ mcp__<serverName>__<toolName>
 断线重连与重启自愈的可执行验证（不经 DSH host）：
 
 ```bash
-npm test   # 错误分类（33 用例）/ 杀 server 子进程自动重连 / 启动失败退避后放弃 / Session not found 调用内恢复 / ECONNREFUSED 重启窗口恢复 + 预算耗尽抛原始错误 + 超时不重试 + 并发共享重建 / 官方对齐五项
+npm test   # 错误分类（33 用例）/ 杀 server 子进程自动重连 / 启动失败退避后放弃 / Session not found 调用内恢复 / ECONNREFUSED 重启窗口恢复 + 预算耗尽抛原始错误 + 超时不重试 + 并发共享重建 / 官方对齐五项 / instructions 注入（注册形状、快照、退订清理、超限拒绝、防御跳过）
 ```
 
 ---

@@ -7,7 +7,7 @@
 - **首步可见**：agent 创建即连接注册，首个模型请求就含 `mcp__*` 工具（[ADR-0003](decisions/0003-created-timing.md)）
 - **断线自愈**：启动失败与中途断线自动重连 + 工具重注册（[ADR-0004](decisions/0004-reconnect-supervisor.md)，移植官方 dsh-mcp-client 的 supervisor）
 - **重启自愈（调用内）**：streamable-http server 重启/会话驱逐后的调用失败按「可证明未触达工具执行」分类（404/-32001 会话失效、502/503、ECONNREFUSED 等），命中即丢弃当前代、等新代就绪后在**同一次调用内重试一次**——模型无感知；ECONNRESET/超时/abort/504 及业务错误刻意不重试（[ADR-0009](decisions/0009-invoke-restart-recovery.md)，判定机制基于 [ADR-0005](decisions/0005-session-loss-detection.md)，官方 dsh-mcp-client 无此能力）
-- **官方对齐**：stdio scrubbed 父环境继承、重复 raw name 守卫、注册冲突整代回滚、outputSchema→structuredContent 输出契约、taskSupport=required 明确拒绝（[ADR-0006](decisions/0006-official-parity.md)）
+- **官方对齐**：stdio scrubbed 父环境继承、重复 raw name 守卫、注册冲突整代回滚、outputSchema→structuredContent 输出契约、taskSupport=required 明确拒绝（[ADR-0006](decisions/0006-official-parity.md)）；server instructions 注入 system prompt（`### MCP server: <名>` 包装、最后成功连接快照、32KB 字节上限，[ADR-0010](decisions/0010-server-instructions.md)）
 - **连接共享**：同一 workspace 的同一 server 条目只保留一份 server 进程，全体 agent 共用——进程份数不随会话/子 agent 数膨胀（[ADR-0008](decisions/0008-shared-connections.md)）
 
 ## 非目标
@@ -46,6 +46,10 @@ path 级（每配置文件一份）：
 - 重连期间旧工具保持注册（模型可见性不抖动）；调用走 supervisor 的恢复桥——
   命中重启分类的在换代后自动重试一次，不可恢复类（ECONNRESET/超时等）原样
   上抛、由模型自行处置
+- server instructions：连接成功即从握手结果取快照（空声明 → 空串、超上限 →
+  该次连接失败走重连）；分发到订阅者时经 agentCtx 注册 per-agent scoped
+  section（text 惰性读快照，重连换代自动跟上），与工具同一份 disposers 清理。
+  agentCtx 无 systemPrompt 服务时跳过注入、不影响工具（防御路径）
 - stdio 子进程环境 = scrubbed 父环境（剥凭据形状名与 `DSH_*`）+ yml `env` 覆盖层（[ADR-0006](decisions/0006-official-parity.md)，与全局 MCP 一致）
 - server 声明受支持的 outputSchema 时进 `structuredContent` 输出契约（required + additionalProperties:false）；重复 raw name / 注册名字被占 → 整代拒绝/回滚，不留半代状态
 - 无配置文件的目录不加载任何 MCP

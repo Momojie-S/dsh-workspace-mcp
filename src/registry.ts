@@ -481,6 +481,49 @@ export class WorkspaceMcpRegistry {
       this.log(
         `conn "${conn.serverName}"@${conn.filePath}: 订阅者 ${sub.agentId} 工具注册失败，该订阅者 0 个工具（已回滚）: ${e?.message ?? e}`
       );
+      return;
+    }
+    this.applyInstructionsSection(conn, sub);
+  }
+
+  /**
+   * 把 server instructions 注入订阅者 agent 的 system prompt（per-agent scoped
+   * section，ADR-0010）。经 agentCtx 访问 systemPrompt 服务时 cordis 的
+   * traceable proxy 使 section 注册落进该 agent 的 scope layer——同名 section
+   * （多个 workspace 的同名 server）跨 agent 各自一层互不冲突，agent 销毁时
+   * scope fiber 卸载自动清理；订阅退订/工具置换时经 disposers 显式清理。
+   *
+   * text 惰性读 `supervision.getInstructions()`：注册时连接可能尚未完成首拉
+   * （空串占位，不渲染），重连换代后快照更新、内容自动跟上。server 未声明
+   * instructions 时 section 文本恒为空串，渲染层过滤空 section、不占 prompt。
+   *
+   * 与工具注册分离容错：agentCtx 无 systemPrompt 服务（headless 形态/测试
+   * 桩）时跳过并记日志，不影响该订阅者的工具注册。
+   */
+  private applyInstructionsSection(conn: SharedConnection, sub: Subscriber): void {
+    const sp = (sub.agentCtx as any)?.systemPrompt;
+    if (!sp || typeof sp.section !== "function" || typeof sp.getSectionOrder !== "function") {
+      this.log(
+        `conn "${conn.serverName}"@${conn.filePath}: 订阅者 ${sub.agentId} 无 systemPrompt 服务，跳过 instructions 注入`
+      );
+      return;
+    }
+    const sectionKey = `section:mcp:${conn.serverName}`;
+    try {
+      sub.disposers.set(
+        sectionKey,
+        sp.section({
+          name: `mcp:${conn.serverName}`,
+          order: sp.getSectionOrder("MCP_SERVERS"),
+          interpolate: false,
+          text: () => conn.supervision.getInstructions(),
+        })
+      );
+    } catch (e: any) {
+      sub.disposers.delete(sectionKey);
+      this.log(
+        `conn "${conn.serverName}"@${conn.filePath}: 订阅者 ${sub.agentId} instructions section 注册失败（不影响工具）: ${e?.message ?? e}`
+      );
     }
   }
 
